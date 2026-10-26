@@ -1,0 +1,452 @@
+/***************************************
+ * GRID_GA4_Sessions.gs
+ * Extract: GA4 Session Overview (monthly)
+ *
+ * SOURCE (config in The Grid - Seth):
+ * - GRID_TABS.CONFIG_GA4 ("Extractor Config - GA4")
+ *
+ * DEST (separate spreadsheet via Sheet Registry):
+ * - DEST.GA4_SESSIONS (tab: "The Grid - GA4 Session Overview")
+ *
+ * RULES:
+ * - NO deletes
+ * - Dedupe + append only
+ * - Monthly incremental:
+ *    - If property has history in dest: (max year_month + 1) → last complete month
+ *    - Else: last complete month minus (backfill_months - 1)
+ * - Pull History: ONE summary row per run
+ ***************************************/
+
+const GA4_SESS_HEADERS_ = [
+  "property_id",
+  "property_resource_name",
+  "property_name",
+  "year_month",
+  "measurement_ids",
+  "session_source_medium",
+  "session_campaign_name",
+  "session_manual_ad_content",
+  "sessions",
+  "total_users",
+  "new_users",
+  "bounces",
+  "pulled_at_utc",
+  "authorized_user"
+];
+
+
+function extractGa4Sessions() {
+  if (!requireAuth()) return;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet(); // The Grid - Seth
+  ensureGridTabs_();
+
+  const service = getService();
+  const tz = ss.getSpreadsheetTimeZone();
+
+  let apiCallCounter = {
+    admin: 0,
+    data: 0
+  };
+
+  const props = getAuthorizedGa4Properties_().map(p => ({
+    ga4_account_name: p.ga4_account_name,
+    ga4_account_resource: p.ga4_account_resource,
+    property_resource_name: p.property_resource_name,
+    property_name: p.property_name,
+    authorized_user: p.authorized_user,
+    backfill_months: 18
+  }));
+  
+  if (!props.length) return "No GA4 properties found in config.";
+
+  // --- Destination sheet via Sheet Registry
+  const outSh = openDestSheetByKey_(DEST.GA4_SESSIONS.key);
+
+  // Ensure headers (no deletes)
+  ensureHeadersExact_(outSh, GA4_SESS_HEADERS_);
+
+  // --- Existing dedupe keys (property_id|year_month|sourceMedium|campaign|adContent)
+  const existingKeys = buildExistingKeysGa4_(outSh);
+
+  // --- Existing max month per property_id for incremental pulls
+  const maxMonthByProp = buildMaxYearMonthByProperty_(outSh);
+
+  // --- Determine last complete month (endYM)
+  const endYM = lastCompleteYearMonth_(new Date(), tz); // e.g. "2026-01"
+
+  // --- Measurement ID cache (best effort)
+  const measurementCache = {}; // propertyId -> "G-XXXX,G-YYYY"
+  function getMeasurementIdsForProperty_(propertyIdNum) {
+    if (measurementCache[propertyIdNum] !== undefined) return measurementCache[propertyIdNum];
+
+    const url = `https://analyticsadmin.googleapis.com/v1beta/properties/${propertyIdNum}/dataStreams`;
+    let ids = [];
+
+    try {
+      const json = fetchJsonGA4Sessions_(service, url, "get", null, "admin", apiCallCounter);
+      (json.dataStreams || []).forEach(s => {
+        const web = s.webStreamData || null;
+        const mid = web && web.measurementId ? String(web.measurementId).trim() : "";
+        if (mid) ids.push(mid);
+      });
+    } catch (e) {
+      ids = [];
+    }
+
+    measurementCache[propertyIdNum] = ids.length ? ids.join(",") : "";
+    return measurementCache[propertyIdNum];
+  }
+
+  let totalNew = 0;
+  let totalErrors = 0;
+
+  let runStartYM = ""; // earliest start among properties
+  let runEndYM = endYM; // same for all
+
+  ss.toast(`GA4 Sessions: starting (${props.length} propert${props.length === 1 ? "y" : "ies"})`, "GRID", 5);
+
+  for (let i = 0; i < props.length; i++) {
+    const p = props[i];
+
+    if (i === 0 || (i + 1) === props.length || (i + 1) % 10 === 0) {
+      ss.toast(`GA4 Sessions: ${i + 1}/${props.length}\n${p.property_resource_name || p.property_name}`, "GRID", 5);
+    }
+
+    const propertyId = toNumericId_(p.property_resource_name);
+    if (!propertyId) continue;
+
+    // backfill months clamp: 1..18 (default 18 if blank/invalid)
+    const backfill = Math.min(18, Math.max(1, Number(p.backfill_months) || 18));
+
+    // incremental monthly start:
+    // - if max exists: next month
+    // - else: endYM minus (backfill - 1)
+    const maxYM = maxMonthByProp[`${p.authorized_user}|${propertyId}`] || "";
+    const startYM = maxYM ? addMonthsYM_(maxYM, 1) : addMonthsYM_(endYM, -(backfill - 1));
+
+    // keep runStartYM as min across properties (for Pull History summary)
+    if (!runStartYM || startYM < runStartYM) runStartYM = startYM;
+
+    // if already caught up
+    if (startYM > endYM) {
+      // touch last_seen_utc if present
+      continue;
+    }
+
+    try {
+      const startDate = ymToStartDate_(startYM);
+      const endDate = ymToEndDate_(endYM);
+
+      const measurementIds = getMeasurementIdsForProperty_(propertyId);
+      const pulledAt = new Date().toISOString();
+
+      const newRows = [];
+
+      // GA4 Data API: runReport pagination
+      const limit = 100000;
+      let offset = 0;
+
+      while (true) {
+        const payload = {
+          dateRanges: [{ startDate, endDate }],
+          dimensions: [
+            { name: "year" },
+            { name: "month" },
+            { name: "sessionSourceMedium" },
+            { name: "sessionCampaignName" },
+            { name: "sessionManualAdContent" }
+          ],
+          metrics: [
+            { name: "sessions" },
+            { name: "totalUsers" },
+            { name: "newUsers" },
+            { name: "engagedSessions" } // used for bounces calc
+          ],
+          limit,
+          offset
+        };
+
+        const url = `https://analyticsdata.googleapis.com/v1beta/properties/${propertyId}:runReport`;
+        const json = fetchJsonGA4Sessions_(service, url, "post", payload, "data", apiCallCounter);
+
+        const rows = json.rows || [];
+        if (!rows.length) break;
+
+        for (const rr of rows) {
+          const dims = rr.dimensionValues || [];
+          const mets = rr.metricValues || [];
+
+          const year = String(dims[0]?.value || "").trim();
+          const month = String(dims[1]?.value || "").trim().padStart(2, "0");
+          const ym = (year && month) ? `${year}-${month}` : "";
+          if (!ym) continue;
+
+          const sourceMedium = String(dims[2]?.value || "").trim();
+          const campaignName = String(dims[3]?.value || "").trim();
+          const adContent = String(dims[4]?.value || "").trim();
+
+          const sessions = Number(mets[0]?.value || 0);
+          const totalUsers = Number(mets[1]?.value || 0);
+          const newUsers = Number(mets[2]?.value || 0);
+          const engagedSessions = Number(mets[3]?.value || 0);
+          const bounces = Math.max(0, sessions - engagedSessions);
+
+          const key = `${p.authorized_user}|${propertyId}|${ym}|${sourceMedium}|${campaignName}|${adContent}`;
+          if (existingKeys.has(key)) continue;
+
+          newRows.push([
+          propertyId,
+          p.property_resource_name || "",
+          p.property_name || "",
+          ym,
+          measurementIds,
+          sourceMedium,
+          campaignName,
+          adContent,
+          sessions,
+          totalUsers,
+          newUsers,
+          bounces,
+          pulledAt,
+          p.authorized_user || ""
+        ]);
+
+
+          existingKeys.add(key);
+        }
+
+        offset += rows.length;
+        if (rows.length < limit) break;
+      }
+
+      if (newRows.length) {
+        outSh.getRange(outSh.getLastRow() + 1, 1, newRows.length, GA4_SESS_HEADERS_.length).setValues(newRows);
+        totalNew += newRows.length;
+
+        // Sort by year_month ascending (like performance)
+        const dataRows = outSh.getLastRow() - 1;
+        if (dataRows > 1) {
+          outSh.getRange(2, 1, dataRows, GA4_SESS_HEADERS_.length)
+          .sort({ column: 4, ascending: true }); // year_month
+
+        }
+      }
+
+    } catch (e) {
+      totalErrors++;
+      dbg_("ERROR", "GA4_SESSIONS", `Property failed: ${p.property_resource_name}`, {
+      property_id: propertyId,
+      property_resource_name: p.property_resource_name,
+      property_name: p.property_name,
+      start_ym: startYM,
+      end_ym: endYM,
+      error: String(e && e.message ? e.message : e),
+      stack: String(e && e.stack ? e.stack : "")
+    });
+
+
+    }
+  }
+
+  // --- Pull History ONE summary row
+  // If runStartYM never set (everything caught up), still log a summary
+  if (!runStartYM) runStartYM = addMonthsYM_(endYM, 0);
+
+  pullHistoryAppendRow_({
+    dataset_key: "extractGa4Sessions",
+    entity_key: "ALL_PROPERTIES",
+    range_start: runStartYM,
+    range_end: runEndYM,
+    rows_added: totalNew,
+    errors_count: totalErrors,
+    notes: totalErrors ? "Completed with errors" : (totalNew ? "OK" : "No new data")
+  });
+
+  const totalApiCalls = apiCallCounter.admin + apiCallCounter.data;
+
+  const apiSummary = [
+    `GA4 Admin x${apiCallCounter.admin}`,
+    `GA4 Data x${apiCallCounter.data}`
+  ].join(", ");
+
+  logApiUsage_(
+    Utilities.formatDate(new Date(), tz, "yyyy-MM-dd"),
+    "GA4_SESSIONS",
+    totalApiCalls,
+    apiSummary
+  );
+
+  ss.toast(`GA4 Sessions: complete\nNew rows: ${totalNew}\nErrors: ${totalErrors}`, "GRID", 6);
+  return `GA4 Sessions complete.\nNew rows: ${totalNew}\nErrors: ${totalErrors}`;
+}
+
+/* ──────────────────────────────
+   DEST opener (Sheet Registry)
+────────────────────────────── */
+function openDestSheetByKey_(destKey) {
+  return gridGetDestSheet_(destKey).sh;
+}
+
+/* ──────────────────────────────
+   Headers enforcement (no deletes)
+   - If empty: write headers
+   - If mismatch: throw (prevents corrupt writes)
+────────────────────────────── */
+function ensureHeadersExact_(sh, expected) {
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+
+  const needsHeaders =
+    lastRow === 0 ||
+    lastCol === 0 ||
+    !sh.getRange(1, 1, 1, Math.max(1, lastCol)).getValues()[0].some(v => String(v || "").trim() !== "");
+
+  if (needsHeaders) {
+    sh.getRange(1, 1, 1, expected.length).setValues([expected]);
+    return;
+  }
+
+  const existing = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h || "").trim());
+  const same = existing.length === expected.length && expected.every((h, i) => h === existing[i]);
+  if (!same) {
+    throw new Error(
+      `GA4 Sessions destination headers do not match expected.\n` +
+      `Expected: ${expected.join(" | ")}\n` +
+      `Found: ${existing.join(" | ")}`
+    );
+  }
+}
+
+/* ──────────────────────────────
+   Dedupe keys builder
+────────────────────────────── */
+function buildExistingKeysGa4_(sh) {
+  const headers = GA4_SESS_HEADERS_;
+  const col = {};
+  headers.forEach((h, i) => (col[h] = i));
+
+  const keys = new Set();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return keys;
+
+  const data = sh.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  for (const r of data) {
+    const user = String(r[col["authorized_user"]] || "").trim();
+    const pid = String(r[col["property_id"]] || "").trim();
+    const ym  = String(r[col["year_month"]] || "").trim();
+    const sm  = String(r[col["session_source_medium"]] || "").trim();
+    const cn  = String(r[col["session_campaign_name"]] || "").trim();
+    const ac  = String(r[col["session_manual_ad_content"]] || "").trim();
+    if (user && pid && ym) keys.add(`${user}|${pid}|${ym}|${sm}|${cn}|${ac}`);
+  }
+  return keys;
+}
+
+/* ──────────────────────────────
+   Max year_month per property (for incremental)
+────────────────────────────── */
+function buildMaxYearMonthByProperty_(sh) {
+  const headers = GA4_SESS_HEADERS_;
+  const col = {};
+  headers.forEach((h, i) => (col[h] = i));
+
+  const out = {}; // property_id -> "YYYY-MM"
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return out;
+
+  const data = sh.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  for (const r of data) {
+    const user = String(r[col["authorized_user"]] || "").trim();
+    const pid = String(r[col["property_id"]] || "").trim();
+    const ym  = String(r[col["year_month"]] || "").trim();
+    const key = `${user}|${pid}`;
+    if (!user || !pid || !ym) continue;
+    const prev = out[key] || "";
+    if (!prev || ym > prev) out[key] = ym;
+  }
+  return out;
+}
+
+/* ──────────────────────────────
+   HTTP JSON helper (uses existing OAuth token)
+────────────────────────────── */
+function fetchJsonGA4Sessions_(service, url, method, payloadObj, counterKey, apiCallCounter) {
+  const params = {
+    method: method || "get",
+    headers: { Authorization: "Bearer " + service.getAccessToken() },
+    muteHttpExceptions: true
+  };
+  if (payloadObj) {
+    params.contentType = "application/json";
+    params.payload = JSON.stringify(payloadObj);
+  }
+
+  if (apiCallCounter && counterKey) apiCallCounter[counterKey]++;
+
+  const res = UrlFetchApp.fetch(url, params);
+  const code = res.getResponseCode();
+  const text = res.getContentText();
+
+  if (code < 200 || code >= 300) {
+    throw new Error(`GA4 fetch failed (${code}): ${text}\nURL: ${url}`);
+  }
+  return text ? JSON.parse(text) : {};
+}
+
+/* ──────────────────────────────
+   YM utils
+────────────────────────────── */
+function lastCompleteYearMonth_(now, tz) {
+  // last complete month relative to "now" (uses spreadsheet tz)
+  const d = new Date(now.getTime());
+  // move to first of current month, then back one day
+  d.setDate(1);
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - 1);
+  const y = Utilities.formatDate(d, tz, "yyyy");
+  const m = Utilities.formatDate(d, tz, "MM");
+  return `${y}-${m}`;
+}
+
+function addMonthsYM_(ym, deltaMonths) {
+  const [y, m] = String(ym || "").split("-").map(n => Number(n));
+  if (!y || !m) return "";
+  const d = new Date(Date.UTC(y, m - 1, 1));
+  d.setUTCMonth(d.getUTCMonth() + Number(deltaMonths || 0));
+  const yy = String(d.getUTCFullYear());
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  return `${yy}-${mm}`;
+}
+
+function ymToStartDate_(ym) {
+  // YYYY-MM -> YYYY-MM-01
+  return `${ym}-01`;
+}
+
+function ymToEndDate_(ym) {
+  // YYYY-MM -> last day of that month
+  const [y, m] = String(ym || "").split("-").map(n => Number(n));
+  const d = new Date(Date.UTC(y, m, 0)); // day 0 of next month = last day of month
+  const yy = String(d.getUTCFullYear());
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${yy}-${mm}-${dd}`;
+}
+
+/* ──────────────────────────────
+   ID normalizer
+────────────────────────────── */
+function toNumericId_(resourceName) {
+  const s = String(resourceName || "").trim();
+  const m = s.match(/(\d+)\s*$/);
+  return m ? m[1] : "";
+}
+
+/* ──────────────────────────────
+   Touch last_seen_utc if column exists
+────────────────────────────── */
+function touchLastSeenUtc_(cfgSheet, colMap, rowNum) {
+  if (colMap["last_seen_utc"] == null) return;
+  cfgSheet.getRange(rowNum, colMap["last_seen_utc"] + 1).setValue(new Date().toISOString());
+}

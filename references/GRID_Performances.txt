@@ -1,0 +1,563 @@
+/***************************************
+ * GRID_Performance.gs
+ * Extract: Performance Metric Overview
+ *
+ * SOURCES:
+ * - Accounts:   GRID_TABS.CONFIG_GMB   (The Grid - Seth)
+ * - Locations:  DEST.LOCATIONS_OVERVIEW (dest spreadsheet tab: "The Grid - Locations Overview")
+ *
+ * DEST:
+ * - DEST.PERF_OVERVIEW (dest spreadsheet tab: "The Grid - Performance Metric Overview")
+ *
+ * RULES:
+ * - NO deletes
+ * - Dedupe + append only
+ * - Date window:
+ *    - If location has history: last_end + 1 day → today
+ *    - Else: 18 months back → today
+ ***************************************/
+
+function extractPerformanceOverview() {
+  if (!requireAuth()) return;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet(); // The Grid - Seth
+  ensureGridTabs_();
+
+  const service = getService();
+  const tz = ss.getSpreadsheetTimeZone();
+
+  let apiCallCounter = {
+    performance: 0
+  };
+
+  // --- Locations Overview (dest)
+  const locSh = openDestSheetByKey_(DEST.LOCATIONS_OVERVIEW.key);
+
+  const locLastCol = locSh.getLastColumn();
+  if (locLastCol < 1) throw new Error(`Locations Overview destination tab has no headers.`);
+
+  const locHeaders = locSh.getRange(1, 1, 1, locLastCol).getValues()[0].map(h => String(h || "").trim());
+  const locCol = {};
+  locHeaders.forEach((h, i) => (locCol[h] = i));
+
+  const reqLoc = ["authorized_user", "account_name", "account_id", "location_id", "location_name"];
+  const missLoc = reqLoc.filter(h => locCol[h] == null);
+  if (missLoc.length) throw new Error(`Locations Overview missing columns: ${missLoc.join(", ")}`);
+
+  const locRows = locSh.getLastRow() >= 2
+    ? locSh.getRange(2, 1, locSh.getLastRow() - 1, locLastCol).getValues()
+    : [];
+
+  const activeUser = getCurrentAuthorizedUserEmail_();
+  const locations = locRows
+    .map(r => ({
+      authorized_user: String(r[locCol["authorized_user"]] || "").trim(),
+      account_name: String(r[locCol["account_name"]] || "").trim(),
+      account_id: String(r[locCol["account_id"]] || "").trim(),       // accounts/####
+      location_id: String(r[locCol["location_id"]] || "").trim(),     // locations/####
+      location_name: String(r[locCol["location_name"]] || "").trim()
+    }))
+    .filter(x => x.account_id && x.location_id && x.authorized_user === activeUser);
+
+  if (!locations.length) return "No locations found. Run extractLocationsOverview first.";
+
+  // --- Perf destination (dest)
+  const outSh = openDestSheetByKey_(DEST.PERF_OVERVIEW.key);
+
+  ensurePerfWideHeaders_(outSh, PERF_OV_HEADERS_);
+
+  // Dedupe set: numeric account_id + date + numeric location_id (matches your original behavior)
+  const existingKeys = buildExistingKeysPerfWide_(outSh);
+
+  // --- Pull History index (per location_id)
+  const histIndex = buildPullHistoryIndex_("extractPerformanceOverview");
+
+  // --- Metrics (same mapping as original)
+  const METRICS = [
+    "BUSINESS_IMPRESSIONS_DESKTOP_MAPS",
+    "BUSINESS_IMPRESSIONS_MOBILE_MAPS",
+    "BUSINESS_IMPRESSIONS_DESKTOP_SEARCH",
+    "BUSINESS_IMPRESSIONS_MOBILE_SEARCH",
+    "WEBSITE_CLICKS",
+    "CALL_CLICKS",
+    "BUSINESS_DIRECTION_REQUESTS",
+    "BUSINESS_BOOKINGS",
+    "BUSINESS_FOOD_MENU_CLICKS",
+    "BUSINESS_FOOD_ORDERS"
+  ];
+
+  // --- End = yesterday (consistent daily scheduling)
+  const end = new Date();
+  end.setDate(end.getDate() - 1);
+  const endYMD = Utilities.formatDate(end, tz, "yyyy-MM-dd");
+
+  // First-pull floor = 18 months back from endYMD
+  const floor18YMD = addMonthsYMD_(endYMD, -18);
+
+  let totalNew = 0;
+  let totalErrors = 0;
+
+  ss.toast(`Performance: starting (${locations.length} location(s))`, "GRID", 5);
+
+  for (let i = 0; i < locations.length; i++) {
+  const loc = locations[i];
+
+  try {
+    // progress toast is safe here too (if it fails it should not stop)
+    if (i === 0 || (i + 1) === locations.length || (i + 1) % 25 === 0) {
+      ss.toast(`Performance: ${i + 1}/${locations.length}\n${loc.location_name || loc.location_id}`, "GRID", 5);
+    }
+
+    // ALL incremental date logic must be inside try
+    const lastEnd = String(histIndex.get(loc.location_id) || "").trim(); // YYYY-MM-DD
+    let startYMD = lastEnd ? addDaysYMD_(lastEnd, 1) : floor18YMD;
+    if (startYMD < floor18YMD) startYMD = floor18YMD;
+
+    if (startYMD > endYMD) continue;
+
+    // API call + row build
+    const wideRows = fetchPerfWideForLocation_(service, loc, startYMD, endYMD, METRICS, apiCallCounter);
+
+    // dedupe + append
+    const filtered = [];
+    for (const r of wideRows) {
+      const acctId = toNumericId_(r[1]);
+      const date   = String(r[4] || "").trim();
+      const locId  = toNumericId_(r[3]);
+      const key = `${acctId}|${date}|${locId}`;
+      if (existingKeys.has(key)) continue;
+      existingKeys.add(key);
+      filtered.push(r);
+    }
+
+    if (filtered.length) {
+      outSh.getRange(outSh.getLastRow() + 1, 1, filtered.length, PERF_OV_HEADERS_.length).setValues(filtered);
+      totalNew += filtered.length;
+    }
+
+  } catch (e) {
+    totalErrors++;
+
+    // log ONE line per failed location with strong context
+    dbg_("ERROR", "PERF", "Location failed", {
+      account_id: loc.account_id,
+      location_id: loc.location_id,
+      location_name: loc.location_name,
+      error: String(e && e.message ? e.message : e),
+      stack: String(e && e.stack ? e.stack : "")
+    });
+
+    // IMPORTANT: continue to next location, no throw
+    continue;
+  }
+}
+
+
+  pullHistoryAppendRow_({
+    dataset_key: "extractPerformanceOverview",
+    entity_key: "ALL_LOCATIONS",
+    range_start: floor18YMD,
+    range_end: endYMD,
+    rows_added: totalNew,
+    errors_count: totalErrors,
+    notes: totalErrors ? "Completed with errors" : "OK"
+  });
+
+  const totalApiCalls = apiCallCounter.performance;
+  const apiSummary = `GBP Performance API x${apiCallCounter.performance}`;
+
+  logApiUsage_(
+    Utilities.formatDate(new Date(), tz, "yyyy-MM-dd"),
+    "PERFORMANCE_OVERVIEW",
+    totalApiCalls,
+    apiSummary
+  );
+
+  ss.toast(`Performance: complete\nNew rows: ${totalNew}\nErrors: ${totalErrors}`, "GRID", 6);
+  return `Performance complete.\nNew rows: ${totalNew}\nErrors: ${totalErrors}`;
+}
+
+/* ──────────────────────────────
+   OUTPUT HEADERS (normalized)
+   If you already have “final headers”, tell me the exact list
+   and I’ll align this 1:1.
+────────────────────────────── */
+const PERF_OV_HEADERS_ = [
+  "account_name",
+  "account_id",
+  "location_name",
+  "location_id",
+  "date",
+  "Total views",
+  "Views on Maps",
+  "Views on Search",
+  "Views on maps (Desktop)",
+  "Views on maps (Mobile)",
+  "Views on Search (Desktop)",
+  "Views on Search (Mobile)",
+  "Website visits",
+  "Phone calls",
+  "Directions requests",
+  "Bookings",
+  "Menu clicks",
+  "Food orders",
+  "pulled_at_utc",
+  "authorized_user"
+];
+
+function ensurePerfWideHeaders_(sh, expectedHeaders) {
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+
+  // If sheet is empty or row1 blank -> write headers
+  const needsHeaders =
+    lastRow === 0 ||
+    lastCol === 0 ||
+    !sh.getRange(1, 1, 1, Math.max(1, lastCol)).getValues()[0].some(v => String(v || "").trim() !== "");
+
+  if (needsHeaders) {
+    sh.getRange(1, 1, 1, expectedHeaders.length).setValues([expectedHeaders]);
+    return;
+  }
+
+  // If headers exist, enforce exact match (to prevent silent mis-writes)
+  const existing = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h || "").trim());
+  const same =
+    existing.length === expectedHeaders.length &&
+    expectedHeaders.every((h, i) => h === existing[i]);
+
+  if (!same) {
+    throw new Error(
+      `Perf destination headers do not match expected wide format.\n` +
+      `Expected: ${expectedHeaders.join(" | ")}\n` +
+      `Found: ${existing.join(" | ")}`
+    );
+  }
+}
+
+
+function toNumericId_(resourceName) {
+  const s = String(resourceName || "").trim();
+  const m = s.match(/(\d+)\s*$/);
+  return m ? m[1] : s; // fallback to original if no digits
+}
+
+
+function buildExistingKeysPerfWide_(sh) {
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(h => String(h || "").trim());
+  const col = {};
+  headers.forEach((h, i) => (col[h] = i));
+
+  const need = ["authorized_user", "account_id", "date", "location_id"];
+  const miss = need.filter(h => col[h] == null);
+  if (miss.length) throw new Error(`Perf sheet missing columns: ${miss.join(", ")}`);
+
+  const keys = new Set();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return keys;
+
+  const data = sh.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  for (const r of data) {
+    const user = String(r[col["authorized_user"]] || "").trim();
+    const acct = toNumericId_(r[col["account_id"]]);
+
+    let dateVal = r[col["date"]];
+    let date = "";
+    if (dateVal instanceof Date) {
+      date = Utilities.formatDate(dateVal, "UTC", "yyyy-MM-dd");
+    } else {
+      date = String(dateVal || "").trim().slice(0, 10);
+    }
+
+    const loc  = toNumericId_(r[col["location_id"]]);
+    if (user && acct && date && loc) keys.add(`${user}|${acct}|${date}|${loc}`);
+  }
+  return keys;
+}
+
+
+
+function fetchPerfWideForLocation_(service, loc, startYMD, endYMD, metrics, apiCallCounter) {
+  const pulledAt = new Date().toISOString();
+
+  const locationRes = String(loc.location_id || "").trim(); // "locations/####"
+  if (!/^locations\/\d+$/.test(locationRes)) {
+    throw new Error(`Bad location_id format (expected "locations/####"): ${locationRes}`);
+  }
+
+  const start = ymdToDateObj_(startYMD);
+  const end = ymdToDateObj_(endYMD);
+
+  const metricQs = (metrics || [])
+    .map(m => "dailyMetrics=" + encodeURIComponent(String(m)))
+    .join("&");
+
+  const url =
+    "https://businessprofileperformance.googleapis.com/v1/" +
+    locationRes +
+    ":fetchMultiDailyMetricsTimeSeries" +
+    "?" + metricQs +
+    "&dailyRange.startDate.year=" + start.year +
+    "&dailyRange.startDate.month=" + start.month +
+    "&dailyRange.startDate.day=" + start.day +
+    "&dailyRange.endDate.year=" + end.year +
+    "&dailyRange.endDate.month=" + end.month +
+    "&dailyRange.endDate.day=" + end.day;
+
+  if (apiCallCounter) apiCallCounter.performance++;
+
+  const res = UrlFetchApp.fetch(url, {
+    method: "get",
+    headers: { Authorization: "Bearer " + service.getAccessToken() },
+    muteHttpExceptions: true
+  });
+
+  const code = res.getResponseCode();
+  const text = res.getContentText();
+  if (code !== 200) throw new Error(`PERF API ${code}: ${text.slice(0, 800)}`);
+
+  const data = JSON.parse(text);
+
+  // dateStr -> metricName -> value
+  const dateMap = {};
+
+  (data.multiDailyMetricTimeSeries || []).forEach(g => {
+    (g.dailyMetricTimeSeries || []).forEach(s => {
+      const metricName = String(s.dailyMetric || "").trim();
+      (s.timeSeries?.datedValues || []).forEach(dv => {
+        const d = dv.date || {};
+        // ✅ Guard: skip invalid dates (prevents 1970-01-01)
+        if (!d.year || !d.month || !d.day) return;
+
+        const dateStr =
+          String(d.year) + "-" +
+          String(d.month).padStart(2, "0") + "-" +
+          String(d.day).padStart(2, "0");
+
+        if (!dateMap[dateStr]) dateMap[dateStr] = {};
+        dateMap[dateStr][metricName] = Number(dv.value || 0);
+      });
+    });
+  });
+
+  const rows = [];
+  const dates = Object.keys(dateMap).sort(); // chronological
+
+  for (const dateStr of dates) {
+    const m = dateMap[dateStr] || {};
+
+    const dm = Number(m.BUSINESS_IMPRESSIONS_DESKTOP_MAPS || 0);
+    const mm = Number(m.BUSINESS_IMPRESSIONS_MOBILE_MAPS || 0);
+    const ds = Number(m.BUSINESS_IMPRESSIONS_DESKTOP_SEARCH || 0);
+    const ms = Number(m.BUSINESS_IMPRESSIONS_MOBILE_SEARCH || 0);
+
+    rows.push([
+      String(loc.account_name || ""),
+      toNumericId_(loc.account_id),      // FIXED
+      String(loc.location_name || ""),
+      toNumericId_(locationRes),         // FIXED
+      dateStr,
+      dm + mm + ds + ms,
+      dm + mm,
+      ds + ms,
+      dm,
+      mm,
+      ds,
+      ms,
+      Number(m.WEBSITE_CLICKS || 0),
+      Number(m.CALL_CLICKS || 0),
+      Number(m.BUSINESS_DIRECTION_REQUESTS || 0),
+      Number(m.BUSINESS_BOOKINGS || 0),
+      Number(m.BUSINESS_FOOD_MENU_CLICKS || 0),
+      Number(m.BUSINESS_FOOD_ORDERS || 0),
+      pulledAt,
+      String(loc.authorized_user || "")
+    ]);
+
+  }
+
+  return rows;
+}
+
+/* ──────────────────────────────
+   FETCH: Performance API (multi daily)
+────────────────────────────── */
+function fetchPerfForLocation_(service, loc, startYMD, endYMD, metrics) {
+  const pulledAt = new Date().toISOString();
+
+  // Ensure location resource is exactly: locations/####
+  const locationRes = String(loc.location_id || "").trim();
+  if (!/^locations\/\d+$/.test(locationRes)) {
+    throw new Error(`Bad location_id format (expected "locations/####"): ${locationRes}`);
+  }
+
+  const start = ymdToDateObj_(startYMD);
+  const end = ymdToDateObj_(endYMD);
+
+  // Build repeated dailyMetrics params
+  const metricQs = (metrics || [])
+    .map(m => "dailyMetrics=" + encodeURIComponent(String(m)))
+    .join("&");
+
+  const url =
+    "https://businessprofileperformance.googleapis.com/v1/" +
+    locationRes +
+    ":fetchMultiDailyMetricsTimeSeries" +
+    "?" + metricQs +
+    "&dailyRange.startDate.year=" + start.year +
+    "&dailyRange.startDate.month=" + start.month +
+    "&dailyRange.startDate.day=" + start.day +
+    "&dailyRange.endDate.year=" + end.year +
+    "&dailyRange.endDate.month=" + end.month +
+    "&dailyRange.endDate.day=" + end.day;
+
+  const res = UrlFetchApp.fetch(url, {
+    method: "get",
+    headers: { Authorization: "Bearer " + service.getAccessToken() },
+    muteHttpExceptions: true
+  });
+
+  const code = res.getResponseCode();
+  const text = res.getContentText();
+
+  if (code !== 200) {
+    throw new Error(`PERF API ${code}: ${text.slice(0, 600)}`);
+  }
+
+  const data = JSON.parse(text);
+  const series = data.multiDailyMetricTimeSeries || [];
+
+  const rows = [];
+  for (const g of series) {
+    const inner = g.dailyMetricTimeSeries || [];
+    for (const s of inner) {
+      const metricName = String(s.dailyMetric || "").trim();
+      const dated = (s.timeSeries && s.timeSeries.datedValues) ? s.timeSeries.datedValues : [];
+
+      for (const dv of dated) {
+        const ymd = dateObjToYMD_(dv.date || {});
+        if (!ymd) continue;
+
+        const val = Number(dv.value || 0);
+
+        rows.push([
+          ymd,
+          "", // account_name optional (can enrich later)
+          String(loc.account_id || ""),
+          locationRes,
+          String(loc.location_name || ""),
+          metricName,
+          isNaN(val) ? "" : val,
+          pulledAt
+        ]);
+      }
+    }
+  }
+
+  return rows;
+}
+
+
+/* ──────────────────────────────
+   DEST OPENERS (Sheet Registry)
+────────────────────────────── */
+function openDestSheetByKey_(destKey) {
+  return gridGetDestSheet_(destKey).sh;
+}
+
+
+/* ──────────────────────────────
+   DEDUPE: existing keyset
+────────────────────────────── */
+function buildExistingKeysPerf_(sh) {
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(h => String(h || "").trim());
+  const col = {};
+  headers.forEach((h, i) => (col[h] = i));
+
+  const need = ["date", "location_id", "metric"];
+  const miss = need.filter(h => col[h] == null);
+  if (miss.length) throw new Error(`Perf sheet missing columns: ${miss.join(", ")}`);
+
+  const keys = new Set();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return keys;
+
+  const data = sh.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  for (const r of data) {
+    const d = String(r[col["date"]] || "").trim();
+    const loc = String(r[col["location_id"]] || "").trim();
+    const m = String(r[col["metric"]] || "").trim();
+    if (d && loc && m) keys.add(`${loc}|${d}|${m}`);
+  }
+  return keys;
+}
+
+/* ──────────────────────────────
+   PULL HISTORY (incremental index)
+────────────────────────────── */
+function buildPullHistoryIndex_(datasetKey) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(GRID_TABS.PULL_HISTORY);
+  if (!sh) throw new Error(`Missing sheet: ${GRID_TABS.PULL_HISTORY}`);
+
+  // Ensure headers exist (no deletes)
+  ensureHeaderRowOnly_(sh, [
+    "pulled_utc","dataset_key","entity_key","range_start","range_end","rows_added","errors_count","notes"
+  ]);
+
+  const idx = new Map();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return idx;
+
+  const rows = sh.getRange(2, 1, lastRow - 1, 8).getValues();
+  for (const r of rows) {
+    const ds = String(r[1] || "").trim();
+    const entity = String(r[2] || "").trim();
+    const end = String(r[4] || "").trim();
+    if (ds !== datasetKey || !entity || !end) continue;
+
+    // Keep the max end date for each entity_key
+    const prev = idx.get(entity) || "";
+    if (!prev || end > prev) idx.set(entity, end);
+  }
+  return idx;
+}
+
+
+/* ──────────────────────────────
+   SMALL UTILITIES
+────────────────────────────── */
+function ensureHeaderRowOnly_(sheet, headerRow) {
+  sheet.getRange(1, 1, 1, headerRow.length).setValues([headerRow]);
+}
+
+function formatYMD_(d, tz) {
+  return Utilities.formatDate(d, tz, "yyyy-MM-dd");
+}
+
+function addDaysYMD_(ymd, days) {
+  const d = new Date(ymd + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + Number(days || 0));
+  return Utilities.formatDate(d, "UTC", "yyyy-MM-dd");
+}
+
+function addMonthsYMD_(ymd, months) {
+  const d = new Date(ymd + "T00:00:00Z");
+  d.setUTCMonth(d.getUTCMonth() + Number(months || 0));
+  return Utilities.formatDate(d, "UTC", "yyyy-MM-dd");
+}
+
+function ymdToDateObj_(ymd) {
+  const [y, m, d] = String(ymd).split("-").map(n => Number(n));
+  return { year: y, month: m, day: d };
+}
+
+function dateObjToYMD_(obj) {
+  const y = Number(obj.year || 0);
+  const m = Number(obj.month || 0);
+  const d = Number(obj.day || 0);
+  if (!y || !m || !d) return "";
+  const mm = String(m).padStart(2, "0");
+  const dd = String(d).padStart(2, "0");
+  return `${y}-${mm}-${dd}`;
+}

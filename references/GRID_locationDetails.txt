@@ -1,0 +1,411 @@
+/***************************************
+ * GRID_LocationDetails.gs
+ * Extract: Location Details (V1 Enriched Schema inside GRID v2)
+ *
+ * SOURCE:
+ *  - Destination sheet from Sheet Registry: dest_key "LOCATIONS_OVERVIEW"
+ *
+ * DEST:
+ *  - Destination sheet from Sheet Registry: dest_key "LOCATION_DETAILS"
+ *
+ * RULES:
+ *  - NO deletes
+ *  - Dedupe + append only (key: account_id|location_id)
+ *  - Enriched via:
+ *      - Business Information API v1 (location readMask)
+ *      - Business Information API v1 (attributes)
+ *      - My Business API v4 (reviews total count)
+ *      - My Business API v4 (media counts)
+ *      - Places API (maps URL + rating) if PLACES_API_KEY exists
+ ***************************************/
+
+const LOC_DETAILS_HEADERS_ = [
+  "Account ID","Account name","Location ID","Location name","Location name & ID","Location description",
+  "Language code","Store code","Primary phone","Additional phones","Regular operating hours","Special operating hours",
+  "Website URL","Google Ads ad phone","Labels","Coordinates","Latitude","Longitude","Attributes","Price lists",
+  "Location status","Opening year","Opening month","Opening day","Address region code","Address language code",
+  "Postal code","Sorting code","Administrative area","Locality","Sublocality","Address lines","Recipients",
+  "Organization","Business type","Google Maps place ID","Google Maps URL","Category ID","Category name",
+  "Additional categories","Avg. overall star rating","Total review count","Media items","Contributed media items","authorized_user"
+];
+
+function extractLocationDetails() {
+  if (!requireAuth()) return;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet(); // The Grid - Seth
+  ensureGridTabs_();
+
+  let apiCallCounter = {
+    v1_location: 0,
+    v1_attributes: 0,
+    reviews: 0,
+    media: 0,
+    places: 0
+  };
+
+  const service = getService();
+
+  // Places API key is OPTIONAL for GRID (don’t hard-fail)
+  const PLACES_API_KEY = PropertiesService.getScriptProperties().getProperty("PLACES_API_KEY") || "";
+
+  // SOURCE = LOCATIONS_OVERVIEW (dest spreadsheet via registry)
+  const src = gridGetDestSheet_("LOCATIONS_OVERVIEW");
+  const locSheet = src.sh;
+
+  // must exist + have headers
+  gridAssertHasHeaders_(locSheet);
+
+  const { col: scol } = gridMapHeaders_(locSheet);
+
+  // minimum required columns on source
+  const requiredMin = ["account_id", "account_name", "location_id", "location_name", "authorized_user"];
+  const missingMin = requiredMin.filter(h => scol[h] == null);
+  if (missingMin.length) {
+    throw new Error(`Locations Overview missing required columns: ${missingMin.join(", ")}`);
+  }
+
+  const lastRow = locSheet.getLastRow();
+  if (lastRow < 2) {
+    throw new Error(`Locations Overview has headers but no rows. Run extractLocationsOverview first.`);
+  }
+
+  // DEST = LOCATION_DETAILS (dest spreadsheet via registry)
+  const dest = gridEnsureDestHeaders_("LOCATION_DETAILS", LOC_DETAILS_HEADERS_);
+  const out = dest.sh;
+
+  // existing dedupe keys on dest (Account ID + Location ID)
+  const existing = gridBuildExistingKeys_(out, ["Account ID", "Location ID", "authorized_user"]);
+
+  // read all source rows
+  const data = locSheet.getRange(2, 1, lastRow - 1, locSheet.getLastColumn()).getValues();
+
+  const pulledAt = new Date().toISOString();
+  const rowsToAppend = [];
+  let newCount = 0;
+  let errors = 0;
+  const activeUser = getCurrentAuthorizedUserEmail_();
+
+  // header index map (fast set_)
+  const hIdx = {};
+  LOC_DETAILS_HEADERS_.forEach((h, i) => (hIdx[h] = i));
+
+  function set_(rowArr, colName, value) {
+    const idx = hIdx[colName];
+    if (idx == null) return;
+    rowArr[idx] = value;
+  }
+
+  ss.toast(`Location Details: scanning ${data.length} locations…`, "GRID", 5);
+
+  for (let i = 0; i < data.length; i++) {
+    const r = data[i];
+
+    const accountName = String(r[scol["account_name"]] || "").trim();
+    const accountIdRaw = String(r[scol["account_id"]] || "").trim();   // usually accounts/####
+    const locationIdRaw = String(r[scol["location_id"]] || "").trim(); // usually locations/####
+    const locationName = String(r[scol["location_name"]] || "").trim();
+    const authorizedUser = String(r[scol["authorized_user"]] || "").trim();
+
+    if (!accountIdRaw || !locationIdRaw || !authorizedUser || authorizedUser !== activeUser) continue;
+
+    const key = `${accountIdRaw}|${locationIdRaw}|${authorizedUser}`;
+    if (existing.has(key)) continue;
+
+    if (i === 0 || (i + 1) === data.length || (i + 1) % 50 === 0) {
+      ss.toast(`Location Details: ${i + 1}/${data.length}\n${locationIdRaw}`, "GRID", 5);
+    }
+
+    const row = new Array(LOC_DETAILS_HEADERS_.length).fill("");
+
+    // Always fill the identifiers (so even error rows become “sticky” via dedupe)
+    set_(row, "Account ID", accountIdRaw);
+    set_(row, "Account name", accountName);
+    set_(row, "authorized_user", authorizedUser);
+    set_(row, "Location ID", locationIdRaw);
+    set_(row, "Location name", locationName);
+    set_(row, "Location name & ID", `${locationName} | ${locationIdRaw}`);
+
+    const accountIdNum = toNumericId_(accountIdRaw);
+    const locationIdNum = toNumericId_(locationIdRaw);
+
+    // If ids are malformed, append minimal row and move on
+    if (!accountIdNum || !locationIdNum) {
+      rowsToAppend.push(row);
+      existing.add(key);
+      newCount++;
+      continue;
+    }
+
+    // ── Fetch core v1 location
+    const v1 = fetchV1Location_(service, locationIdRaw, apiCallCounter);
+    if (v1 && v1._error) {
+      errors++;
+      set_(row, "Location description", `ERROR ${v1._error.code}: ${String(v1._error.text || "").slice(0, 800)}`);
+      rowsToAppend.push(row);
+      existing.add(key);
+      newCount++;
+      continue;
+    }
+
+    // ── Fetch attributes (non-fatal)
+    const v1Attrs = fetchV1Attributes_(service, locationIdRaw, apiCallCounter);
+    if (v1Attrs && v1Attrs._error) errors++;
+
+    // Map from v1
+    set_(row, "Language code", v1.languageCode || "");
+    set_(row, "Store code", v1.storeCode || "");
+
+    // Description
+    set_(row, "Location description", (v1.profile && v1.profile.description) ? v1.profile.description : "");
+
+    // Phones
+    const phones = v1.phoneNumbers || {};
+    set_(row, "Primary phone", phones.primaryPhone || "");
+    set_(row, "Additional phones", safeJson_(phones.additionalPhones || []));
+
+    // Hours
+    set_(row, "Regular operating hours", safeJson_(v1.regularHours || {}));
+    set_(row, "Special operating hours", safeJson_(v1.specialHours || {}));
+
+    // Website + labels
+    set_(row, "Website URL", v1.websiteUri || "");
+    set_(row, "Labels", safeJson_(v1.labels || []));
+
+    // Coordinates
+    set_(row, "Coordinates", safeJson_(v1.latlng || {}));
+    set_(row, "Latitude", (v1.latlng && v1.latlng.latitude != null) ? v1.latlng.latitude : "");
+    set_(row, "Longitude", (v1.latlng && v1.latlng.longitude != null) ? v1.latlng.longitude : "");
+
+    // Address breakdown
+    const addr = v1.storefrontAddress || {};
+    set_(row, "Address region code", addr.regionCode || "");
+    set_(row, "Address language code", addr.languageCode || "");
+    set_(row, "Postal code", addr.postalCode || "");
+    set_(row, "Sorting code", addr.sortingCode || "");
+    set_(row, "Administrative area", addr.administrativeArea || "");
+    set_(row, "Locality", addr.locality || "");
+    set_(row, "Sublocality", addr.sublocality || "");
+    set_(row, "Address lines", safeJson_(addr.addressLines || []));
+    set_(row, "Recipients", safeJson_(addr.recipients || []));
+    set_(row, "Organization", addr.organization || "");
+
+    // Categories
+    const cats = v1.categories || {};
+    const primaryCat = cats.primaryCategory || {};
+    set_(row, "Category ID", primaryCat.name || "");
+    set_(row, "Category name", primaryCat.displayName || "");
+    set_(row, "Additional categories", safeJson_(cats.additionalCategories || []));
+
+    // Business type (best-effort)
+    set_(row, "Business type", primaryCat.displayName || "");
+
+    // Opening date
+    const openingDate = v1.openInfo && v1.openInfo.openingDate ? v1.openInfo.openingDate : {};
+    set_(row, "Opening year", openingDate.year || "");
+    set_(row, "Opening month", openingDate.month || "");
+    set_(row, "Opening day", openingDate.day || "");
+
+    // Attributes (JSON)
+    set_(row, "Attributes", safeJson_((v1Attrs && !v1Attrs._error) ? v1Attrs : {}));
+
+    // Place ID
+    const placeId = (v1.metadata && v1.metadata.placeId) ? String(v1.metadata.placeId) : "";
+    set_(row, "Google Maps place ID", placeId);
+
+    // Places enrichment (optional)
+    if (PLACES_API_KEY && placeId) {
+      const places = fetchPlaces_(PLACES_API_KEY, placeId, apiCallCounter);
+      if (places && places._error) {
+        errors++;
+      } else {
+        set_(row, "Google Maps URL", places.mapsUrl || "");
+        set_(row, "Avg. overall star rating", (places.rating != null ? places.rating : ""));
+      }
+    }
+
+    // Reviews total count (v4)
+    const reviews = fetchReviewsCount_(service, accountIdNum, locationIdNum, apiCallCounter);
+    if (reviews && reviews._error) {
+      errors++;
+    } else {
+      set_(row, "Total review count", (reviews && reviews.totalReviewCount != null) ? reviews.totalReviewCount : "");
+    }
+
+    // Media counts (v4)
+    const media = fetchMediaCounts_(service, accountIdNum, locationIdNum, apiCallCounter);
+    if (media && media._error) {
+      errors++;
+    } else {
+      set_(row, "Media items", (media && media.mediaCount != null) ? media.mediaCount : "");
+      set_(row, "Contributed media items", (media && media.contribCount != null) ? media.contribCount : "");
+    }
+
+    rowsToAppend.push(row);
+    existing.add(key);
+    newCount++;
+  }
+
+  if (rowsToAppend.length) {
+    out.getRange(out.getLastRow() + 1, 1, rowsToAppend.length, LOC_DETAILS_HEADERS_.length).setValues(rowsToAppend);
+  }
+
+  const totalApiCalls =
+    apiCallCounter.v1_location +
+    apiCallCounter.v1_attributes +
+    apiCallCounter.reviews +
+    apiCallCounter.media +
+    apiCallCounter.places;
+
+  const apiSummary = [
+    `V1 Location x${apiCallCounter.v1_location}`,
+    `V1 Attributes x${apiCallCounter.v1_attributes}`,
+    `Reviews x${apiCallCounter.reviews}`,
+    `Media x${apiCallCounter.media}`,
+    `Places x${apiCallCounter.places}`
+  ].join(", ");
+
+  logApiUsage_(
+    new Date().toISOString().slice(0, 10),
+    "LOCATION_DETAILS",
+    totalApiCalls,
+    apiSummary
+  );
+
+  ss.toast(`Location Details: complete\nNew rows: ${newCount}\nErrors: ${errors}`, "GRID", 6);
+  return `Location Details complete. New rows appended: ${newCount}. Errors: ${errors}`;
+}
+
+/* ──────────────────────────────
+   Helpers (enrichment)
+────────────────────────────── */
+
+function toNumericId_(s) {
+  const m = String(s || "").trim().match(/(\d+)\s*$/);
+  return m ? m[1] : "";
+}
+
+function safeJson_(v) {
+  try { return JSON.stringify(v ?? null); } catch (e) { return ""; }
+}
+
+function fetchJsonOAuth_(service, url, counterKey, apiCallCounter) {
+  if (apiCallCounter && counterKey) apiCallCounter[counterKey]++;
+  const res = UrlFetchApp.fetch(url, {
+    method: "get",
+    headers: { Authorization: "Bearer " + service.getAccessToken() },
+    muteHttpExceptions: true
+  });
+
+  const code = res.getResponseCode();
+  const text = res.getContentText();
+
+  if (code !== 200) return { _error: { code, text, url } };
+  return JSON.parse(text);
+}
+
+function fetchV1Location_(service, locationIdRaw, apiCallCounter) {
+  const readMask = [
+    "name",
+    "title",
+    "languageCode",
+    "storeCode",
+    "phoneNumbers",
+    "websiteUri",
+    "latlng",
+    "regularHours",
+    "specialHours",
+    "labels",
+    "categories",
+    "storefrontAddress",
+    "openInfo",
+    "metadata",
+    "profile"
+  ].join(",");
+
+  const loc = String(locationIdRaw || "").trim();
+  const url = `https://mybusinessbusinessinformation.googleapis.com/v1/${loc}?readMask=${encodeURIComponent(readMask)}`;
+  return fetchJsonOAuth_(service, url, "v1_location", apiCallCounter);
+}
+
+function fetchV1Attributes_(service, locationIdRaw, apiCallCounter) {
+  const loc = String(locationIdRaw || "").trim();
+  const url = `https://mybusinessbusinessinformation.googleapis.com/v1/${loc}/attributes`;
+  return fetchJsonOAuth_(service, url, "v1_attributes", apiCallCounter);
+}
+
+function fetchReviewsCount_(service, accountIdNum, locationIdNum, apiCallCounter) {
+  const name = `accounts/${accountIdNum}/locations/${locationIdNum}`;
+  const url = `https://mybusiness.googleapis.com/v4/${name}/reviews?pageSize=1`;
+
+  const json = fetchJsonOAuth_(service, url, "reviews", apiCallCounter);
+  if (json && json._error) return json;
+
+  return { totalReviewCount: Number(json.totalReviewCount || 0) };
+}
+
+function fetchMediaCounts_(service, accountIdNum, locationIdNum, apiCallCounter) {
+  const parent = `accounts/${accountIdNum}/locations/${locationIdNum}`;
+
+  function countAll_(urlBase) {
+    let count = 0;
+    let pageToken = "";
+
+    do {
+      const url = urlBase + `?pageSize=250` +
+        (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "");
+
+      const json = fetchJsonOAuth_(service, url, "media", apiCallCounter);
+      if (json && json._error) return json;
+
+      const items = json.mediaItems || [];
+      count += Array.isArray(items) ? items.length : 0;
+
+      pageToken = json.nextPageToken || "";
+    } while (pageToken);
+
+    return { count };
+  }
+
+  const media = countAll_(`https://mybusiness.googleapis.com/v4/${parent}/media`);
+  if (media && media._error) return { _error: media._error };
+
+  const contrib = countAll_(`https://mybusiness.googleapis.com/v4/${parent}/media/customers`);
+  if (contrib && contrib._error) return { _error: contrib._error };
+
+  return { mediaCount: media.count, contribCount: contrib.count };
+}
+
+function fetchPlaces_(PLACES_API_KEY, placeId, apiCallCounter) {
+  if (!placeId) return { mapsUrl: "", rating: "" };
+
+  const url = `https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`;
+  if (apiCallCounter) apiCallCounter.places++;
+  const res = UrlFetchApp.fetch(url, {
+    method: "get",
+    headers: {
+      "X-Goog-Api-Key": PLACES_API_KEY,
+      "X-Goog-FieldMask": "googleMapsLinks,rating"
+    },
+    muteHttpExceptions: true
+  });
+
+  const code = res.getResponseCode();
+  const text = res.getContentText();
+
+  if (code !== 200) return { _error: { code, text, url } };
+
+  const json = JSON.parse(text);
+  const gml = json.googleMapsLinks || {};
+
+  const mapsUrl =
+    gml.placeUri ||
+    gml.placeURI ||
+    gml.googleMapsUri ||
+    gml.googleMapsURI ||
+    "";
+
+  return {
+    mapsUrl,
+    rating: (json.rating != null ? Number(json.rating) : "")
+  };
+}

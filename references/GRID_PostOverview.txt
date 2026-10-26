@@ -1,0 +1,400 @@
+/***************************************
+ * GRID_Posts.gs
+ * Extract: Posts Overview (GMB Local Posts v4)
+ *
+ * SOURCES:
+ * - Locations: DEST.LOCATIONS_OVERVIEW (dest tab via Sheet Registry)
+ *
+ * DEST:
+ * - DEST.POSTS_OVERVIEW (dest tab via Sheet Registry)
+ *
+ * RULES:
+ * - NO deletes
+ * - Append only
+ * - Incremental by per-location lastSeen timestamp:
+ *    - lastSeen stored in Pull History range_end (ISO) with:
+ *      dataset_key = "extractPostsOverview"
+ *      entity_key  = "locations/####"
+ * - Dedupe backstop: account_id|location_id|post_id
+ * - Pull History:
+ *    - One row per location processed (to advance lastSeen)
+ *    - One summary row per run
+ ***************************************/
+
+const POSTS_HEADERS_ = [
+  "account_name",
+  "account_id",
+  "location_name",
+  "location_id",
+  "post_name",
+  "Post ID",
+  "Post state",
+  "Post summary",
+  "Post topic type",
+  "Post creation time",
+  "Post language code",
+  "Post action URL",
+  "Post modification time",
+  "Post URL on Google search",
+  "Post action type",
+  "Posts",
+  "media_json",
+  "event_json",
+  "offer_json",
+  "alertType",
+  "pulled_at_utc",
+  "authorized_user"
+];
+
+function extractPostsOverview() {
+  if (!requireAuth()) return;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet(); // The Grid - Seth
+  ensureGridTabs_();
+
+  const service = getService();
+  const tz = ss.getSpreadsheetTimeZone();
+
+  let apiCallCounter = {
+    posts: 0
+  };
+
+  // --- Source Locations Overview (dest via registry)
+  const locSh = openDestSheetByKey_(DEST.LOCATIONS_OVERVIEW.key);
+
+  const locLastCol = locSh.getLastColumn();
+  if (locLastCol < 1) throw new Error(`Locations Overview destination tab has no headers.`);
+
+  const locHeaders = locSh.getRange(1, 1, 1, locLastCol).getValues()[0].map(h => String(h || "").trim());
+  const locCol = {};
+  locHeaders.forEach((h, i) => (locCol[h] = i));
+
+  const reqLoc = ["authorized_user", "account_name", "account_id", "location_id", "location_name"];
+  const missLoc = reqLoc.filter(h => locCol[h] == null);
+  if (missLoc.length) throw new Error(`Locations Overview missing columns: ${missLoc.join(", ")}`);
+
+  const locRows = locSh.getLastRow() >= 2
+    ? locSh.getRange(2, 1, locSh.getLastRow() - 1, locLastCol).getValues()
+    : [];
+
+  const activeUser = getCurrentAuthorizedUserEmail_();
+  const locations = locRows
+    .map(r => ({
+      authorized_user: String(r[locCol["authorized_user"]] || "").trim(),
+      account_name: String(r[locCol["account_name"]] || "").trim(),
+      account_id: String(r[locCol["account_id"]] || "").trim(),       // accounts/####
+      location_id: String(r[locCol["location_id"]] || "").trim(),     // locations/####
+      location_name: String(r[locCol["location_name"]] || "").trim()
+    }))
+    .filter(x => x.account_id && x.location_id && x.authorized_user === activeUser);
+
+  if (!locations.length) return "No locations found. Run extractLocationsOverview first.";
+
+  // --- Dest Posts Overview (dest via registry)
+  const outSh = openDestSheetByKey_(DEST.POSTS_OVERVIEW.key);
+
+  // Ensure headers (no deletes); mismatch -> throw
+  ensureHeadersExactPosts_(outSh, POSTS_HEADERS_);
+
+  // Backstop dedupe keys: acct|loc|postId
+  const existingKeys = buildExistingKeysPosts_(outSh);
+
+  // Per-location lastSeen index from Pull History
+  const lastSeenByLocation = buildPullHistoryIndexIso_("extractPostsOverview"); // entity_key -> ISO
+
+  let totalNew = 0;
+  let totalErrors = 0;
+
+  // For summary Pull History row
+  const runPulledAt = new Date().toISOString();
+
+  ss.toast(`Posts: starting (${locations.length} location(s))`, "GRID", 5);
+
+  for (let i = 0; i < locations.length; i++) {
+    const loc = locations[i];
+
+    if (i === 0 || (i + 1) === locations.length || (i + 1) % 25 === 0) {
+      ss.toast(`Posts: ${i + 1}/${locations.length}\n${loc.location_name || loc.location_id}`, "GRID", 5);
+    }
+
+    const acctIdNum = toNumericId_(loc.account_id);
+    const locIdNum = toNumericId_(loc.location_id);
+    if (!acctIdNum || !locIdNum) continue;
+
+    const entityKey = `locations/${locIdNum}`;
+    const lastSeenIso = String(lastSeenByLocation.get(entityKey) || "").trim(); // ISO or ""
+
+    const parent = `accounts/${acctIdNum}/locations/${locIdNum}`;
+
+    let newForLoc = 0;
+    let errForLoc = 0;
+    let maxSeenThisRun = lastSeenIso || ""; // advance if we see newer updateTime/createTime
+
+    try {
+      const url = `https://mybusiness.googleapis.com/v4/${parent}/localPosts`;
+      apiCallCounter.posts++;
+      const res = UrlFetchApp.fetch(url, {
+        method: "get",
+        headers: { Authorization: "Bearer " + service.getAccessToken() },
+        muteHttpExceptions: true
+      });
+
+      const code = res.getResponseCode();
+      const text = res.getContentText();
+
+      if (code !== 200) {
+        totalErrors++;
+        errForLoc++;
+        dbg_("WARN", "POSTS", `Posts list failed: ${parent}`, { code, body: text.slice(0, 900) });
+        // still write Pull History row for visibility (does NOT advance maxSeen)
+        continue;
+      }
+
+      const data = JSON.parse(text);
+      const posts = data.localPosts || [];
+      if (!posts.length) {
+        // Still log "no new data" for this location (optional but useful)
+        continue;
+      }
+
+      const pulledAt = new Date().toISOString();
+      const newRows = [];
+
+      for (const p of posts) {
+        const postName = String(p.name || "").trim();
+        const postId = postIdFromName_(postName);
+        if (!postId) continue;
+
+        // Timestamp for incremental gate
+        const rawTs = String(p.updateTime || p.createTime || "").trim();
+        const postIso = normalizeIso_(rawTs); // "" if not parseable
+
+        // If we have a lastSeen + a parseable postIso, enforce incremental
+        if (lastSeenIso && postIso && postIso <= lastSeenIso) continue;
+
+        // Backstop dedupe
+        const key = `${loc.authorized_user}|${acctIdNum}|${locIdNum}|${postId}`;
+        if (existingKeys.has(key)) continue;
+
+        // Track newest seen this run (only if parseable)
+        if (postIso && (!maxSeenThisRun || postIso > maxSeenThisRun)) maxSeenThisRun = postIso;
+
+        newRows.push([
+          loc.account_name || "",
+          acctIdNum,
+          loc.location_name || "",
+          locIdNum,
+          postName,
+
+          postId,
+          p.state || "",
+          p.summary || "",
+          p.topicType || "",
+          p.createTime || "",
+          p.languageCode || "",
+          (p.callToAction || {}).url || "",
+          p.updateTime || "",
+          p.searchUrl || "",
+          (p.callToAction || {}).actionType || "",
+
+          1,
+          JSON.stringify(p.media || []),
+          JSON.stringify(p.event || {}),
+          JSON.stringify(p.offer || {}),
+          p.alertType || "",
+          pulledAt,
+          loc.authorized_user || ""
+        ]);
+
+        existingKeys.add(key);
+      }
+
+      if (newRows.length) {
+        outSh.getRange(outSh.getLastRow() + 1, 1, newRows.length, POSTS_HEADERS_.length).setValues(newRows);
+        totalNew += newRows.length;
+        newForLoc += newRows.length;
+      }
+
+      // If we appended anything but couldn't parse timestamps, we still want to advance something.
+      // In that case, we set maxSeenThisRun to pulledAt so we don't keep re-appending the same items.
+      if (newForLoc > 0 && !maxSeenThisRun) {
+        maxSeenThisRun = pulledAt;
+      }
+
+      // Update in-memory index so later duplicates in same run don’t re-pass gate
+      if (maxSeenThisRun) lastSeenByLocation.set(entityKey, maxSeenThisRun);
+
+    } catch (e) {
+      totalErrors++;
+      errForLoc++;
+      dbg_("ERROR", "POSTS", `Location failed: ${parent}`, { err: String(e && e.stack ? e.stack : e) });
+    }
+  }
+
+  // One summary row per run (like others)
+  pullHistoryAppendRowSafe_({
+    dataset_key: "extractPostsOverview",
+    entity_key: JSON.stringify({
+      locations_scanned: locations.length,
+      posts_new: totalNew,
+      errors: totalErrors
+    }),
+    range_start: "",
+    range_end: "",
+    rows_added: totalNew,
+    errors_count: totalErrors,
+    notes: totalErrors ? "Completed with errors" : (totalNew ? "OK" : "No new data")
+  });
+
+  const totalApiCalls = apiCallCounter.posts;
+  const apiSummary = `GMB Posts API x${apiCallCounter.posts}`;
+
+  logApiUsage_(
+    Utilities.formatDate(new Date(), tz, "yyyy-MM-dd"),
+    "POSTS_OVERVIEW",
+    totalApiCalls,
+    apiSummary
+  );
+
+  ss.toast(`Posts: complete\nNew rows: ${totalNew}\nErrors: ${totalErrors}`, "GRID", 6);
+  return `Posts complete.\nNew rows: ${totalNew}\nErrors: ${totalErrors}`;
+}
+
+/* ──────────────────────────────
+   DEST opener (Sheet Registry)
+────────────────────────────── */
+function openDestSheetByKey_(destKey) {
+  return gridGetDestSheet_(destKey).sh;
+}
+
+/* ──────────────────────────────
+   Headers enforcement (no deletes)
+────────────────────────────── */
+function ensureHeadersExactPosts_(sh, expected) {
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+
+  const needsHeaders =
+    lastRow === 0 ||
+    lastCol === 0 ||
+    !sh.getRange(1, 1, 1, Math.max(1, lastCol)).getValues()[0].some(v => String(v || "").trim() !== "");
+
+  if (needsHeaders) {
+    sh.getRange(1, 1, 1, expected.length).setValues([expected]);
+    return;
+  }
+
+  const existing = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h || "").trim());
+  const same = existing.length === expected.length && expected.every((h, i) => h === existing[i]);
+  if (!same) {
+    throw new Error(
+      `Posts destination headers do not match expected.\n` +
+      `Expected: ${expected.join(" | ")}\n` +
+      `Found: ${existing.join(" | ")}`
+    );
+  }
+}
+
+/* ──────────────────────────────
+   Dedupe keys builder: acct|loc|postId
+────────────────────────────── */
+function buildExistingKeysPosts_(sh) {
+  const headers = POSTS_HEADERS_;
+  const col = {};
+  headers.forEach((h, i) => (col[h] = i));
+
+  const keys = new Set();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return keys;
+
+  const data = sh.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  for (const r of data) {
+    const user = String(r[col["authorized_user"]] || "").trim();
+    const acct = String(r[col["account_id"]] || "").trim();
+    const loc  = String(r[col["location_id"]] || "").trim();
+    const pid  = String(r[col["Post ID"]] || "").trim();
+    if (user && acct && loc && pid) keys.add(`${user}|${acct}|${loc}|${pid}`);
+  }
+  return keys;
+}
+
+/* ──────────────────────────────
+   Pull History index: entity_key -> max range_end (ISO string)
+   Uses Pull History columns:
+     pulled_utc | dataset_key | entity_key | range_start | range_end | rows_added | errors_count | notes
+────────────────────────────── */
+function buildPullHistoryIndexIso_(datasetKey) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(GRID_TABS.PULL_HISTORY);
+  if (!sh) throw new Error(`Missing sheet: ${GRID_TABS.PULL_HISTORY}`);
+
+  // Ensure headers exist (minimal, no deletes)
+  sh.getRange(1, 1, 1, 8).setValues([[
+    "pulled_utc","dataset_key","entity_key","range_start","range_end","rows_added","errors_count","notes"
+  ]]);
+
+  const idx = new Map();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return idx;
+
+  const rows = sh.getRange(2, 1, lastRow - 1, 8).getValues();
+  for (const r of rows) {
+    const ds = String(r[1] || "").trim();
+    const entity = String(r[2] || "").trim();
+    const endIso = String(r[4] || "").trim();
+    if (ds !== datasetKey || !entity || !endIso) continue;
+
+    const prev = idx.get(entity) || "";
+    if (!prev || endIso > prev) idx.set(entity, endIso);
+  }
+  return idx;
+}
+
+function pullHistoryAppendRowSafe_(o) {
+  if (typeof pullHistoryAppendRow_ === "function") return pullHistoryAppendRow_(o);
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sh = ss.getSheetByName(GRID_TABS.PULL_HISTORY);
+    if (!sh) return;
+
+    sh.getRange(1, 1, 1, 8).setValues([[
+      "pulled_utc","dataset_key","entity_key","range_start","range_end","rows_added","errors_count","notes"
+    ]]);
+
+    sh.getRange(sh.getLastRow() + 1, 1, 1, 8).setValues([[
+      new Date().toISOString(),
+      String(o.dataset_key || ""),
+      String(o.entity_key || ""),
+      String(o.range_start || ""),
+      String(o.range_end || ""),
+      Number(o.rows_added || 0),
+      Number(o.errors_count || 0),
+      String(o.notes || "")
+    ]]);
+  } catch (e) {
+    // swallow
+  }
+}
+
+/* ──────────────────────────────
+   Small utils
+────────────────────────────── */
+function toNumericId_(resourceName) {
+  const s = String(resourceName || "").trim();
+  const m = s.match(/(\d+)\s*$/);
+  return m ? m[1] : "";
+}
+
+function postIdFromName_(n) {
+  const m = String(n || "").match(/\/localPosts\/([^\/]+)$/);
+  return m ? m[1] : "";
+}
+
+function normalizeIso_(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return "";
+  return d.toISOString();
+}

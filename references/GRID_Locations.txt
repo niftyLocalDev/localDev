@@ -1,0 +1,376 @@
+/***************************************
+ * GRID_Locations.gs
+ * Extract: Locations Overview
+ *
+ * Source:
+ *  - "Extractor Config - GMB" (in The Grid - Seth)
+ *
+ * Destination:
+ *  - Uses "Sheet Registry" tab in The Grid - Seth
+ *  - Reads spreadsheet_id where dest_key == "LOCATIONS_OVERVIEW"
+ *  - Writes to tab: "The Grid - Locations Overview" in that destination spreadsheet
+ *
+ * Rules:
+ *  - NO deletes
+ *  - Dedupe + append only
+ ***************************************/
+
+const GRID_DEST_KEYS = {
+  LOCATIONS_OVERVIEW: "LOCATIONS_OVERVIEW",
+};
+
+
+const GRID_LOCATIONS_OVERVIEW_TABNAME = GRID_PREFIX +  "Locations Overview";
+
+/* ──────────────────────────────
+   MAIN
+────────────────────────────── */
+function extractLocationsOverview() {
+  if (!requireAuth()) return;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet(); // The Grid - Seth
+  ensureGridTabs_();
+
+  const service = getService();
+
+  let apiCallCounter = {
+    locations: 0
+  };
+
+  // ---- Read GMB accounts from config tab for the active authorized user
+  const accounts = getAuthorizedGmbAccounts_();
+
+
+  if (!accounts.length) {
+    dbgSafe_("WARN", "extractLocationsOverview", "No accounts found in config.", {});
+    return "No accounts found.";
+  }
+
+  // ---- Destination sheet via Sheet Registry (NO creation here)
+  const out = openDestSheetFromRegistry_(
+    GRID_DEST_KEYS.LOCATIONS_OVERVIEW,
+    GRID_LOCATIONS_OVERVIEW_TABNAME,
+    LOC_OV_HEADERS_
+  );
+
+  // ---- Build existing keys for dedupe: authorized_user|account_id|location_id
+  const existingKeys = buildExistingKeys_(out, { keyCols: ["authorized_user", "account_id", "location_id"] });
+
+  const readMask = [
+    "name",
+    "title",
+    "languageCode",
+    "storeCode",
+    "phoneNumbers",
+    "websiteUri",
+    "latlng",
+    "regularHours",
+    "specialHours",
+    "labels",
+    "categories",
+    "storefrontAddress",
+    "metadata",
+    "serviceArea"
+  ].join(",");
+
+  const pulledAt = new Date().toISOString();
+  let totalNew = 0;
+  const summary = [];
+
+  ss.toast(`Locations Overview: starting (${accounts.length} account(s))`, "GRID", 5);
+
+  for (let a = 0; a < accounts.length; a++) {
+    const acct = accounts[a];
+
+    if (a === 0 || (a + 1) === accounts.length || (a + 1) % 10 === 0) {
+      ss.toast(`Locations Overview: ${a + 1}/${accounts.length}\n${acct.account_name || acct.account_id}`, "GRID", 5);
+    }
+
+    let newRows = 0;
+    let pageToken = "";
+    const rowsToAppend = [];
+
+    try {
+      do {
+        const url =
+          `https://mybusinessbusinessinformation.googleapis.com/v1/${acct.account_id}/locations` +
+          `?readMask=${encodeURIComponent(readMask)}` +
+          (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "");
+        
+        apiCallCounter.locations++;
+
+        const res = UrlFetchApp.fetch(url, {
+          method: "get",
+          headers: { Authorization: "Bearer " + service.getAccessToken() },
+          muteHttpExceptions: true
+        });
+
+        const code = res.getResponseCode();
+        const text = res.getContentText();
+
+        if (code !== 200) {
+          dbgSafe_("WARN", "extractLocationsOverview", `Locations list failed`, {
+            account: acct.account_id,
+            code,
+            body: text.slice(0, 800)
+          });
+
+          // Append an error row (still append-only)
+          rowsToAppend.push(makeLocErrRow_(acct, code, text, pulledAt));
+          break;
+        }
+
+        const data = JSON.parse(text);
+        const locs = data.locations || [];
+
+        for (const l of locs) {
+          const locationRes = String(l.name || "").trim(); // locations/####
+          if (!locationRes) continue;
+
+          const key = `${acct.authorized_user}|${acct.account_id}|${locationRes}`;
+          if (existingKeys.has(key)) continue;
+
+          rowsToAppend.push([
+            acct.account_name || "",
+            acct.account_id || "",      // account_id
+            locationRes,                           // location_id
+            l.title || "",
+            l.storeCode || "",
+            JSON.stringify(l.storefrontAddress || {}),
+            (l.categories && l.categories.primaryCategory)
+              ? (l.categories.primaryCategory.displayName || l.categories.primaryCategory.name || "")
+              : "",
+            JSON.stringify((l.categories && l.categories.additionalCategories) ? l.categories.additionalCategories : []),
+            l.phoneNumbers ? (l.phoneNumbers.primaryPhone || "") : "",
+            l.websiteUri || "",
+            l.latlng ? (l.latlng.latitude || "") : "",
+            l.latlng ? (l.latlng.longitude || "") : "",
+            JSON.stringify(l.regularHours || {}),
+            JSON.stringify(l.specialHours || {}),
+            JSON.stringify(l.serviceArea || {}),
+            JSON.stringify(l.labels || []),
+            JSON.stringify(l.metadata || {}),
+            pulledAt,
+            acct.authorized_user || ""
+          ]);
+
+          existingKeys.add(key);
+          newRows++;
+        }
+
+        pageToken = data.nextPageToken || "";
+      } while (pageToken);
+
+      if (rowsToAppend.length) {
+        out.getRange(out.getLastRow() + 1, 1, rowsToAppend.length, LOC_OV_HEADERS_.length).setValues(rowsToAppend);
+      }
+
+      totalNew += newRows;
+      summary.push(`Account | ${acct.account_name || acct.account_id} : ${newRows} new location rows`);
+
+    } catch (e) {
+      dbgSafe_("ERROR", "extractLocationsOverview", "Exception while pulling locations", {
+        account: acct.account_id,
+        err: String(e && e.stack ? e.stack : e)
+      });
+
+      out.getRange(out.getLastRow() + 1, 1, 1, LOC_OV_HEADERS_.length)
+        .setValues([makeLocExRow_(acct, e, pulledAt)]);
+
+      summary.push(`Account | ${acct.account_name || acct.account_id} : EXCEPTION (row appended)`);
+    }
+  }
+
+  pullHistoryAppendSafe_("extractLocationsOverview", {
+    new_rows: totalNew,
+    accounts: accounts.length
+  });
+
+  const totalApiCalls = apiCallCounter.locations;
+  const apiSummary = `GMB Locations x${apiCallCounter.locations}`;
+
+  logApiUsage_(
+    new Date().toISOString().slice(0,10),
+    "LOCATIONS_OVERVIEW",
+    totalApiCalls,
+    apiSummary
+  );
+
+
+
+  ss.toast(`Locations Overview: complete\nNew rows: ${totalNew}`, "GRID", 6);
+  return summary.join("\n");
+}
+
+/* ──────────────────────────────
+   OUTPUT HEADERS
+────────────────────────────── */
+const LOC_OV_HEADERS_ = [
+  "account_name",
+  "account_id",
+  "location_id",
+  "location_name",
+  "store_code",
+  "storefront_address_json",
+  "primary_category",
+  "additional_categories_json",
+  "primary_phone",
+  "website",
+  "lat",
+  "lng",
+  "regular_hours_json",
+  "special_hours_json",
+  "service_area_json",
+  "labels_json",
+  "metadata_json",
+  "pulled_at_utc",
+  "authorized_user"
+];
+
+/* ──────────────────────────────
+   DESTINATION LOOKUP (Sheet Registry)
+   Sheet Registry headers (expected):
+     dest_key | file_name | tab_name | spreadsheet_id | created_utc | last_used_utc
+────────────────────────────── */
+function openDestSheetFromRegistry_(destKey, tabName, headers) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet(); // The Grid - Seth
+  const reg = ss.getSheetByName(GRID_TABS.SHEET_REGISTRY);
+  if (!reg) throw new Error(`Missing tab: ${GRID_TABS.SHEET_REGISTRY}. Run gridInit first.`);
+
+  const regHeaders = reg.getRange(1, 1, 1, reg.getLastColumn()).getValues()[0].map(h => String(h || "").trim());
+  const c = {};
+  regHeaders.forEach((h, i) => (c[h] = i));
+
+  const required = ["dest_key", "spreadsheet_id"];
+  const missing = required.filter(h => c[h] == null);
+  if (missing.length) {
+    throw new Error(`"${GRID_TABS.SHEET_REGISTRY}" is missing columns: ${missing.join(", ")}. Run gridInit to rebuild headers.`);
+  }
+
+  const lastRow = reg.getLastRow();
+  if (lastRow < 2) {
+    throw new Error(`"${GRID_TABS.SHEET_REGISTRY}" is empty. Run gridInit to create destination spreadsheets.`);
+  }
+
+  const rows = reg.getRange(2, 1, lastRow - 1, reg.getLastColumn()).getValues();
+
+  let spreadsheetId = "";
+  let registryRowNum = -1;
+
+  for (let i = 0; i < rows.length; i++) {
+    const k = String(rows[i][c["dest_key"]] || "").trim();
+    const id = String(rows[i][c["spreadsheet_id"]] || "").trim();
+    if (k === destKey && id) {
+      spreadsheetId = id;
+      registryRowNum = i + 2;
+      break;
+    }
+  }
+
+  if (!spreadsheetId) {
+    throw new Error(
+      `No destination found in "${GRID_TABS.SHEET_REGISTRY}" for dest_key="${destKey}". ` +
+      `Run gridInit to create/register it.`
+    );
+  }
+
+  const destSs = SpreadsheetApp.openById(spreadsheetId);
+
+  // Ensure tab exists + headers (no deletes)
+  let sh = destSs.getSheetByName(tabName);
+  if (!sh) sh = destSs.insertSheet(tabName);
+
+  // If row1 empty, write headers
+  const row1 = sh.getRange(1, 1, 1, headers.length).getValues()[0];
+  const hasAny = row1.some(v => String(v || "").trim() !== "");
+  if (!hasAny) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  }
+
+  // Touch last_used_utc if column exists
+  if (registryRowNum > 0 && c["last_used_utc"] != null) {
+    reg.getRange(registryRowNum, c["last_used_utc"] + 1).setValue(new Date().toISOString());
+  }
+
+  return sh;
+}
+
+/* ──────────────────────────────
+   DEDUPE KEYSET BUILDER
+   Key = join(keyCols by "|")
+────────────────────────────── */
+function buildExistingKeys_(sh, opts) {
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(h => String(h || "").trim());
+  const col = {};
+  headers.forEach((h, i) => (col[h] = i));
+
+  const keyCols = opts.keyCols || [];
+  const missing = keyCols.filter(k => col[k] == null);
+  if (missing.length) throw new Error(`Dest sheet missing key columns: ${missing.join(", ")}`);
+
+  const keys = new Set();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return keys;
+
+  const data = sh.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  data.forEach(r => {
+    const parts = keyCols.map(k => String(r[col[k]] || "").trim());
+    if (parts.every(Boolean)) keys.add(parts.join("|"));
+  });
+
+  return keys;
+}
+
+/* ──────────────────────────────
+   ERROR/EXCEPTION ROW HELPERS
+────────────────────────────── */
+function makeLocErrRow_(acct, code, text, pulledAt) {
+  return [
+    acct.account_name || "",
+    acct.account_id || "",
+    `ERROR ${code}`,
+    `Account ${acct.account_name || acct.account_id}`,
+    "",
+    text || "",
+    "",
+    "[]",
+    "",
+    "",
+    "",
+    "",
+    "{}", "{}", "{}", "[]", "{}", pulledAt
+  ];
+}
+
+function makeLocExRow_(acct, e, pulledAt) {
+  return [
+    acct.account_name || "",
+    acct.account_id || "",
+    "EXCEPTION",
+    "Exception while pulling locations",
+    "",
+    (e && e.stack) ? e.stack : String(e || ""),
+    "",
+    "[]",
+    "",
+    "",
+    "",
+    "",
+    "{}", "{}", "{}", "[]", "{}", pulledAt
+  ];
+}
+
+/* ──────────────────────────────
+   SAFE LOGGING / HISTORY (won’t crash if not wired yet)
+────────────────────────────── */
+function dbgSafe_(level, context, message, obj) {
+  if (typeof dbg_ === "function") return dbg_(level, context, message, obj);
+  try {
+    console.log(`[${level}] ${context} ${message}`, obj ? JSON.stringify(obj).slice(0, 2000) : "");
+  } catch (e) {}
+}
+
+function pullHistoryAppendSafe_(datasetKey, meta) {
+  if (typeof pullHistoryAppend_ === "function") return pullHistoryAppend_(datasetKey, meta);
+  // no-op for now
+}

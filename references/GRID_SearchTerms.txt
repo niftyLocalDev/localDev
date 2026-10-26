@@ -1,0 +1,347 @@
+/***************************************
+ * GRID_SearchTermsOverview.gs
+ * Extract: Search Terms Overview (Monthly)
+ *
+ * API:
+ * - Business Profile Performance API
+ *   GET https://businessprofileperformance.googleapis.com/v1/{parent=locations/*}/searchkeywords/impressions/monthly
+ *
+ * DEST:
+ * - SEARCH_TERMS_OVERVIEW
+ *
+ * RULES:
+ * - NO deletes
+ * - Append only
+ * - Existing Search Terms logic remains intact
+ ***************************************/
+
+const SEARCH_TERMS_HEADERS_ = [
+  "Year & month",
+  "Account ID",
+  "Account name",
+  "Location ID",
+  "Location name",
+  "Search terms",
+  "Monthly search impressions",
+  "authorized_user"
+];
+
+function extractSearchTerms() {
+  if (!requireAuth()) return;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ensureGridTabs_();
+
+  const service = getService();
+  const tz = ss.getSpreadsheetTimeZone();
+
+  let apiCallCounter = {
+    search_terms: 0
+  };
+
+  // ---- Source: Locations Overview
+  const locSh = gridGetDestSheet_(DEST.LOCATIONS_OVERVIEW.key).sh;
+  gridAssertHasHeaders_(locSh);
+
+  const { headers: locHeaders, col: locCol } = gridMapHeaders_(locSh);
+
+  const reqLoc = ["authorized_user", "account_name", "account_id", "location_id", "location_name"];
+  const missLoc = reqLoc.filter(h => locCol[h] == null);
+  if (missLoc.length) throw new Error(`Locations Overview missing columns: ${missLoc.join(", ")}`);
+
+  const locLastRow = locSh.getLastRow();
+  const locRows = (locLastRow >= 2)
+    ? locSh.getRange(2, 1, locLastRow - 1, locHeaders.length).getValues()
+    : [];
+
+  const activeUser = getCurrentAuthorizedUserEmail_();
+  const locations = locRows
+    .map(r => ({
+      authorized_user: String(r[locCol["authorized_user"]] || "").trim(),
+      account_name: String(r[locCol["account_name"]] || "").trim(),
+      account_id: String(r[locCol["account_id"]] || "").trim(),
+      location_id: String(r[locCol["location_id"]] || "").trim(),
+      location_name: String(r[locCol["location_name"]] || "").trim()
+    }))
+    .filter(x => x.account_id && x.location_id && x.authorized_user === activeUser);
+
+  if (!locations.length) return "No locations found. Run extractLocationsOverview first.";
+
+  // ---- Dest: Search Terms Overview
+  const dest = gridEnsureDestHeaders_(DEST.SEARCH_TERMS_OVERVIEW.key, SEARCH_TERMS_HEADERS_);
+  const outSh = dest.sh;
+
+  // ---- Existing dedupe keys
+  const existingKeys = buildExistingKeysSearchTerms_(outSh);
+
+  // ---- Pull History index
+  const lastMonthByLocation = buildPullHistoryIndexMonth_("extractSearchTerms");
+
+  // ---- End month: last full month
+  const endMonthYMD = firstDayOfPrevMonthYMD_(tz);
+
+  // ---- 18-month inclusive backfill start
+  const floor18YMD = addMonthsYMD_(endMonthYMD, -17);
+
+  let totalNew = 0;
+  let totalErrors = 0;
+
+  ss.toast(`Search Terms: starting (${locations.length} location(s))`, "GRID", 5);
+
+  for (let i = 0; i < locations.length; i++) {
+    const loc = locations[i];
+
+    if (i === 0 || (i + 1) === locations.length || (i + 1) % 25 === 0) {
+      ss.toast(`Search Terms: ${i + 1}/${locations.length}\n${loc.location_name || loc.location_id}`, "GRID", 5);
+    }
+
+    const locNum = toNumericIdSearch_(loc.location_id);
+    if (!locNum) continue;
+
+    const entityKey = `locations/${locNum}`;
+    const lastEnd = String(lastMonthByLocation.get(entityKey) || "").trim();
+
+    let startYMD = lastEnd ? addMonthsYMD_(String(lastEnd).slice(0, 10), 1) : floor18YMD;
+    if (startYMD < floor18YMD) startYMD = floor18YMD;
+
+    if (startYMD > endMonthYMD) continue;
+
+    try {
+      let cursor = startYMD;
+
+      while (cursor <= endMonthYMD) {
+        const rowsForMonth = fetchSearchTermsForLocationMonth_(service, loc, cursor, cursor, apiCallCounter);
+
+        const filtered = [];
+        for (const r of rowsForMonth) {
+          const user   = normSearch_(r[8]);
+          const ymKey  = normSearch_(r[0]);
+          const acctId = normSearch_(r[1]);
+          const locId  = normSearch_(r[3]);
+          const term   = normSearch_(r[5]);
+          const key = `${user}|${acctId}|${locId}|${ymKey}|${term}`;
+
+          if (existingKeys.has(key)) continue;
+          existingKeys.add(key);
+          filtered.push(r);
+        }
+
+        if (filtered.length) {
+          outSh.getRange(outSh.getLastRow() + 1, 1, filtered.length, SEARCH_TERMS_HEADERS_.length).setValues(filtered);
+          totalNew += filtered.length;
+        }
+
+        cursor = addMonthsYMD_(cursor, 1);
+      }
+
+    } catch (e) {
+      totalErrors++;
+
+      dbg_("ERROR", "SEARCH_TERMS", "Location failed", {
+        account_id: loc.account_id,
+        location_id: loc.location_id,
+        location_name: loc.location_name,
+        error: String(e && e.message ? e.message : e),
+        stack: String(e && e.stack ? e.stack : "")
+      });
+    }
+  }
+
+  pullHistoryAppendRow_({
+    dataset_key: "extractSearchTerms",
+    entity_key: "ALL_LOCATIONS",
+    range_start: floor18YMD.slice(0, 7),
+    range_end:   endMonthYMD.slice(0, 7),
+    rows_added: totalNew,
+    errors_count: totalErrors,
+    notes: totalErrors ? "Completed with errors" : (totalNew ? "OK" : "No new data")
+  });
+
+  const totalApiCalls = apiCallCounter.search_terms;
+  const apiSummary = `GBP Search Terms API x${apiCallCounter.search_terms}`;
+
+  logApiUsage_(
+    Utilities.formatDate(new Date(), tz, "yyyy-MM-dd"),
+    "SEARCH_TERMS_OVERVIEW",
+    totalApiCalls,
+    apiSummary
+  );
+
+  ss.toast(`Search Terms: complete\nNew rows: ${totalNew}\nErrors: ${totalErrors}`, "GRID", 6);
+  return `Search Terms complete.
+New rows: ${totalNew}
+Errors: ${totalErrors}`;
+}
+
+/* ──────────────────────────────
+   Existing Search Terms API pull
+────────────────────────────── */
+function fetchSearchTermsForLocationMonth_(service, loc, startMonthYMD, endMonthYMD, apiCallCounter) {
+  const locRaw = String(loc.location_id || "").trim();
+  const locNum = toNumericIdSearch_(locRaw);
+  if (!locNum) throw new Error(`Bad location_id (expected locations/####): ${locRaw}`);
+
+  const y1 = Number(startMonthYMD.slice(0, 4));
+  const m1 = Number(startMonthYMD.slice(5, 7));
+  const y2 = Number(endMonthYMD.slice(0, 4));
+  const m2 = Number(endMonthYMD.slice(5, 7));
+
+  const parent = `locations/${locNum}`;
+
+  let pageToken = "";
+  const rows = [];
+
+  do {
+    const url =
+      `https://businessprofileperformance.googleapis.com/v1/${parent}/searchkeywords/impressions/monthly` +
+      `?monthlyRange.startMonth.year=${y1}` +
+      `&monthlyRange.startMonth.month=${m1}` +
+      `&monthlyRange.endMonth.year=${y2}` +
+      `&monthlyRange.endMonth.month=${m2}` +
+      `&pageSize=100` +
+      (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : "");
+
+    if (apiCallCounter) apiCallCounter.search_terms++;
+
+    const res = UrlFetchApp.fetch(url, {
+      method: "get",
+      headers: { Authorization: "Bearer " + service.getAccessToken() },
+      muteHttpExceptions: true
+    });
+
+    const code = res.getResponseCode();
+    const text = res.getContentText();
+
+    if (code !== 200) {
+      throw new Error(`SEARCH TERMS API ${code}: ${text.slice(0, 900)}`);
+    }
+
+    const data = text ? JSON.parse(text) : {};
+    const counts = data.searchKeywordsCounts || [];
+    const ym = startMonthYMD.slice(0, 7);
+
+    for (const c of counts) {
+      const term = String(c.searchKeyword || "").trim();
+      if (!term) continue;
+
+      const iv = c.insightsValue || {};
+      const impressionsRaw = (iv.value != null) ? iv.value : (iv.threshold != null ? iv.threshold : "0");
+      const impressions = Number(impressionsRaw || 0);
+
+      rows.push([
+        ym,
+        String(loc.account_id || ""),
+        String(loc.account_name || ""),
+        String(loc.location_id || ""),
+        String(loc.location_name || ""),
+        term.toLowerCase(),
+        isNaN(impressions) ? 0 : impressions,
+        String(loc.authorized_user || "")
+      ]);
+    }
+
+    pageToken = String(data.nextPageToken || "").trim();
+  } while (pageToken);
+
+  return rows;
+}
+
+/* ──────────────────────────────
+   Dedupe builders
+────────────────────────────── */
+function buildExistingKeysSearchTerms_(sh) {
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return new Set();
+
+  const lastCol = sh.getLastColumn();
+  const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h || "").trim());
+
+  const col = {};
+  headers.forEach((h, i) => { if (h) col[h] = i; });
+
+  const need = ["authorized_user", "Year & month", "Account ID", "Location ID", "Search terms"];
+  const miss = need.filter(h => col[h] == null);
+  if (miss.length) throw new Error(`Search Terms dest missing columns: ${miss.join(", ")}`);
+
+  const keys = new Set();
+  const data = sh.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+  for (const r of data) {
+    const ymVal = r[col["Year & month"]];
+    const ym = (ymVal instanceof Date)
+      ? Utilities.formatDate(ymVal, "UTC", "yyyy-MM")
+      : normSearch_(ymVal);
+
+    const user = normSearch_(r[col["authorized_user"]]);
+    const acct = normSearch_(r[col["Account ID"]]);
+    const loc  = normSearch_(r[col["Location ID"]]);
+    const term = normSearch_(r[col["Search terms"]]);
+
+    if (user && ym && acct && loc && term) keys.add(`${user}|${acct}|${loc}|${ym}|${term}`);
+  }
+
+  return keys;
+}
+
+/* ──────────────────────────────
+   Pull History
+────────────────────────────── */
+function buildPullHistoryIndexMonth_(datasetKey) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(GRID_TABS.PULL_HISTORY);
+  if (!sh) throw new Error(`Missing sheet: ${GRID_TABS.PULL_HISTORY}`);
+
+  sh.getRange(1, 1, 1, 8).setValues([[
+    "pulled_utc","dataset_key","entity_key","range_start","range_end","rows_added","errors_count","notes"
+  ]]);
+
+  const idx = new Map();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return idx;
+
+  const rows = sh.getRange(2, 1, lastRow - 1, 8).getValues();
+  for (const r of rows) {
+    const ds = String(r[1] || "").trim();
+    const entity = String(r[2] || "").trim();
+    const end = String(r[4] || "").trim();
+    if (ds !== datasetKey || !entity || !end) continue;
+
+    const prev = idx.get(entity) || "";
+    if (!prev || end > prev) idx.set(entity, end);
+  }
+  return idx;
+}
+
+/* ──────────────────────────────
+   Utilities
+────────────────────────────── */
+function normSearch_(v) {
+  return String(v || "")
+    .normalize("NFKC")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function toNumericIdSearch_(s) {
+  const m = String(s || "").trim().match(/(\d+)\s*$/);
+  return m ? m[1] : "";
+}
+
+function addMonthsYMD_(ymd, months) {
+  const d = new Date(String(ymd).slice(0, 10) + "T00:00:00Z");
+  d.setUTCMonth(d.getUTCMonth() + Number(months || 0));
+  return Utilities.formatDate(d, "UTC", "yyyy-MM-dd");
+}
+
+function firstDayOfPrevMonthYMD_(tz) {
+  const d = new Date();
+  const y = Number(Utilities.formatDate(d, tz, "yyyy"));
+  const m = Number(Utilities.formatDate(d, tz, "MM"));
+
+  const firstCur = new Date(Date.UTC(y, m - 1, 1));
+  firstCur.setUTCMonth(firstCur.getUTCMonth() - 1);
+
+  return Utilities.formatDate(firstCur, "UTC", "yyyy-MM-dd");
+}

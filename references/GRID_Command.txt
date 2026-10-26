@@ -1,0 +1,1692 @@
+const GRID_PREFIX = "The Grid - ";
+let ACTIVE_USER_EMAIL_ = "";
+
+const GRID_TABS = {
+  CONFIG_GMB: "Extractor Config - GMB",
+  CONFIG_GA4: "Extractor Config - GA4",
+  PULL_HISTORY: "Pull History",
+  SHEET_REGISTRY: "Sheet Registry",
+  DEBUG_LOG: "Debug Log",
+  API_USAGE: "Api Usage",
+  COMMAND_REGISTRY: "Command Registry",
+};
+
+const DEST = {
+  LOCATIONS_OVERVIEW: {
+    key: "LOCATIONS_OVERVIEW",
+    fileName: GRID_PREFIX + "Locations Overview",
+    tabName: GRID_PREFIX + "Locations Overview"
+  },
+  LOCATION_DETAILS: {
+    key: "LOCATION_DETAILS",
+    fileName: GRID_PREFIX + "Location Details",
+    tabName: GRID_PREFIX + "Location Details"
+  },
+  PERF_OVERVIEW: {
+    key: "PERF_OVERVIEW",
+    fileName: GRID_PREFIX + "Performance Metric Overview",
+    tabName: GRID_PREFIX + "Performance Metric Overview"
+  },
+  POSTS_OVERVIEW: {
+    key: "POSTS_OVERVIEW",
+    fileName: GRID_PREFIX + "Posts Overview",
+    tabName: GRID_PREFIX + "Posts Overview"
+  },
+  REVIEWS_OVERVIEW: {
+    key: "REVIEWS_OVERVIEW",
+    fileName: GRID_PREFIX + "Reviews Overview",
+    tabName: GRID_PREFIX + "Reviews Overview"
+  },
+  SEARCH_TERMS_OVERVIEW: {
+    key: "SEARCH_TERMS_OVERVIEW",
+    fileName: GRID_PREFIX + "Search Term Overview",
+    tabName: GRID_PREFIX + "Search Term Overview"
+  },
+  GA4_SESSIONS: {
+    key: "GA4_SESSIONS",
+    fileName: GRID_PREFIX + "GA4 Session Overview",
+    tabName: GRID_PREFIX + "GA4 Session Overview"
+  },
+  GA4_EVENTS: {
+    key: "GA4_EVENTS",
+    fileName: GRID_PREFIX + "GA4 Event Overview",
+    tabName: GRID_PREFIX + "GA4 Event Overview"
+  },
+  KEYWORD_RANKING: {
+    key: "KEYWORD_RANKING",
+    fileName: GRID_PREFIX + "Keyword Ranking",
+    tabName: GRID_PREFIX + "Keyword Ranking"
+  },
+  KEYWORD_LIST: {
+    key: "KEYWORD_LIST",
+    fileName: GRID_PREFIX + "Keyword List",
+    tabName: GRID_PREFIX + "Keyword List"
+  },
+};
+
+/**
+ * Adds the custom GRID menu to the spreadsheet and opens the sidebar on file open.
+ * This is the main entry point for the spreadsheet UI experience.
+ */
+function onOpen(e) {
+  SpreadsheetApp.getUi()
+    .createMenu("GRID")
+    .addItem("Open Interface", "showGridSidebar")
+    .addToUi();
+
+  showGridSidebar();
+}
+
+/**
+ * Runs the same startup behavior as onOpen after the script is installed.
+ * This ensures the menu and sidebar are available immediately after install.
+ */
+function onInstall(e) {
+  onOpen(e);
+}
+
+/**
+ * Builds and displays the sidebar HTML for the GRID interface.
+ * This is the server-side wrapper that renders the sidebar UI.
+ */
+function showGridSidebar() {
+  const html = HtmlService.createHtmlOutput(getGridSidebarHtml_())
+    .setTitle("GRID");
+  SpreadsheetApp.getUi().showSidebar(html);
+}
+
+/**
+ * Executes a requested function from the sidebar only if it is explicitly allowlisted.
+ * This prevents arbitrary function execution from the client-side console.
+ */
+function GRID_run(fnName) {
+  fnName = String(fnName || "").trim();
+  if (!fnName) throw new Error("Missing command.");
+
+  const allowed = new Set([
+    "gridInit",
+    "setupCommand",
+    "manualRefreshAll",
+    "setAuth",
+    "resetAuth",
+    "extractLocationsOverview",
+    "extractLocationDetails",
+    "extractPerformanceOverview",
+    "extractSearchTerms",
+    "extractKeywordCompetitorRanks",
+    "extractGa4Sessions",
+    "extractGa4Events",
+    "extractPostsOverview",
+    "extractReviewsOverview",
+    "accountsRefresh",
+    "pauseCadence",
+    "setDailyCadence",  
+    "setMonthlyCadence",
+    "runFullCadence"  
+  ]);
+
+  if (!allowed.has(fnName)) throw new Error(`Command not allowed: ${fnName}`);
+
+  const globalFn = this[fnName];
+  if (typeof globalFn !== "function") throw new Error(`Function not found: ${fnName}`);
+
+  const result = globalFn();
+  return (result == null) ? "" : String(result);
+}
+
+/**
+ * Reads the Sheet Registry and returns the destination spreadsheet and tab for a given dest key.
+ * Also updates last_used_utc when that column exists.
+ */
+function gridGetDestSheet_(destKey) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const reg = ss.getSheetByName(GRID_TABS.SHEET_REGISTRY);
+  if (!reg) throw new Error(`Missing tab: ${GRID_TABS.SHEET_REGISTRY}`);
+
+  const lastRow = reg.getLastRow();
+  const lastCol = reg.getLastColumn();
+  if (lastRow < 2) throw new Error(`Sheet Registry is empty. Run gridInit first.`);
+
+  const headers = reg.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h || "").trim());
+  const col = {};
+  headers.forEach((h, i) => { if (h) col[h] = i; });
+
+  const createdCol = (col["created_utc"] != null) ? "created_utc"
+                   : (col["created_at_utc"] != null) ? "created_at_utc"
+                   : null;
+
+  const required = ["dest_key", "spreadsheet_id", "tab_name"];
+  const missing = required.filter(h => col[h] == null);
+  if (missing.length) {
+    throw new Error(`Sheet Registry missing required column(s): ${missing.join(", ")}.\nFound: ${headers.join(" | ")}`);
+  }
+
+  const data = reg.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+  let foundRowIndex = -1;
+  let found = null;
+
+  for (let i = 0; i < data.length; i++) {
+    const k = String(data[i][col["dest_key"]] || "").trim();
+    if (k === String(destKey || "").trim()) {
+      found = data[i];
+      foundRowIndex = i + 2;
+      break;
+    }
+  }
+
+  if (!found) throw new Error(`Sheet Registry missing dest_key: ${destKey}`);
+
+  const spreadsheetId = String(found[col["spreadsheet_id"]] || "").trim();
+  const tabName = String(found[col["tab_name"]] || "").trim();
+
+  if (!spreadsheetId) throw new Error(`Sheet Registry row for ${destKey} has blank spreadsheet_id.`);
+  if (!tabName) throw new Error(`Sheet Registry row for ${destKey} has blank tab_name.`);
+
+  if (col["last_used_utc"] != null) {
+    reg.getRange(foundRowIndex, col["last_used_utc"] + 1).setValue(new Date().toISOString());
+  }
+
+  const destSs = SpreadsheetApp.openById(spreadsheetId);
+  const sh = destSs.getSheetByName(tabName);
+  if (!sh) throw new Error(`Destination tab not found: "${tabName}" in spreadsheet ${spreadsheetId}`);
+
+  return { destSs, sh, spreadsheetId, tabName };
+}
+
+/**
+ * Verifies that a sheet has at least one non-blank header in row 1.
+ * Throws an error when the sheet is effectively empty.
+ */
+function gridAssertHasHeaders_(sheet) {
+  const lastCol = sheet.getLastColumn();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 1 || lastCol < 1) throw new Error(`Sheet "${sheet.getName()}" is empty (no headers).`);
+
+  const row1 = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const hasAny = row1.some(v => String(v || "").trim() !== "");
+  if (!hasAny) throw new Error(`Sheet "${sheet.getName()}" is empty (no headers).`);
+}
+
+/**
+ * Configures and returns the OAuth2 service used for GBP and GA4 access.
+ * This centralizes all OAuth settings including scopes, refresh behavior, and callbacks.
+ */
+function getService() {
+  return OAuth2.createService('GBP')
+    .setAuthorizationBaseUrl('https://accounts.google.com/o/oauth2/auth')
+    .setTokenUrl('https://oauth2.googleapis.com/token')
+    .setClientId(PropertiesService.getScriptProperties().getProperty('CLIENT_ID'))
+    .setClientSecret(PropertiesService.getScriptProperties().getProperty('CLIENT_SECRET'))
+    .setCallbackFunction('authCallback')
+    .setPropertyStore(PropertiesService.getUserProperties())
+    .setScope([
+      'https://www.googleapis.com/auth/business.manage',
+      'https://www.googleapis.com/auth/analytics.readonly'
+    ])
+    .setParam('access_type', 'offline')
+    .setParam('prompt', 'consent');
+}
+
+/**
+ * Handles the OAuth callback response and returns a simple success or denial page.
+ * This completes the user authorization flow.
+ */
+function authCallback(request) {
+  const service = getService();
+  const authorized = service.handleCallback(request);
+  return HtmlService.createHtmlOutput(
+    authorized ? 'Success! You can close this tab.' : 'Denied'
+  );
+}
+
+/**
+ * Checks whether OAuth access is currently available.
+ * Logs an authorization URL to the debug log when access is missing.
+ */
+function requireAuth() {
+  const service = getService();
+
+  if (!service.hasAccess()) {
+    const authorizationUrl = service.getAuthorizationUrl();
+
+    try {
+      dbg_("ERROR", "AUTH", "Missing OAuth access. Re-authorize using URL.", {
+        lastError: service.getLastError ? service.getLastError() : "",
+        authorizationUrl
+      });
+    } catch (e) {}
+
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Clears the stored OAuth token so the user can re-authorize cleanly.
+ * This is useful for token resets and troubleshooting.
+ */
+function resetAuth() {
+  const service = getService();
+  service.reset();
+  SpreadsheetApp.getUi().alert("OAuth token cleared. Run Auth Test again to re-authorize.");
+}
+
+/**
+ * Starts the authorization process by showing the user the OAuth URL.
+ * If already authorized, it exits with a notice.
+ */
+function setAuth() {
+  const service = getService();
+
+  if (service.hasAccess()) {
+    SpreadsheetApp.getUi().alert("Already authorized.");
+    return;
+  }
+
+  const authorizationUrl = service.getAuthorizationUrl();
+
+  SpreadsheetApp.getUi().alert(
+    "Authorize this app by visiting this URL:\n\n" + authorizationUrl
+  );
+}
+
+function getAuthUiState() {
+  try {
+    const service = getService();
+    const authorized = !!service.hasAccess();
+    const email = String(
+      (Session.getActiveUser && Session.getActiveUser().getEmail && Session.getActiveUser().getEmail()) || ""
+    ).trim();
+    ACTIVE_USER_EMAIL_ = email;
+
+    let firstName = "User";
+    if (email) {
+      const localPart = email.split("@")[0] || "";
+      const cleaned = localPart
+        .replace(/[._-]+/g, " ")
+        .trim()
+        .split(/\s+/)[0] || "";
+      if (cleaned) {
+        firstName = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+      }
+    }
+
+    return {
+      authorized,
+      email,
+      firstName,
+      label: authorized ? `Online User: ${firstName}` : "Offline"
+    };
+  } catch (e) {
+    ACTIVE_USER_EMAIL_ = "";
+    return {
+      authorized: false,
+      email: "",
+      firstName: "User",
+      label: "Offline"
+    };
+  }
+}
+
+function getCurrentAuthorizedUserEmail_() {
+  const email = String(
+    (Session.getActiveUser && Session.getActiveUser().getEmail && Session.getActiveUser().getEmail()) || ""
+  ).trim();
+  ACTIVE_USER_EMAIL_ = email;
+  return email;
+}
+
+function getAuthorizedGmbAccounts_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(GRID_TABS.CONFIG_GMB);
+  if (!sh || sh.getLastRow() < 2) return [];
+
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(h => String(h || "").trim());
+  const col = {};
+  headers.forEach((h, i) => { if (h) col[h] = i; });
+
+  const req = ["account_name", "account_id", "authorized_user"];
+  const missing = req.filter(h => col[h] == null);
+  if (missing.length) throw new Error(`CONFIG_GMB missing columns: ${missing.join(", ")}`);
+
+  const activeUser = getCurrentAuthorizedUserEmail_();
+  if (!activeUser) return [];
+
+  return sh.getRange(2, 1, sh.getLastRow() - 1, headers.length).getValues()
+    .map(r => ({
+      account_name: String(r[col["account_name"]] || "").trim(),
+      account_id: String(r[col["account_id"]] || "").trim(),
+      authorized_user: String(r[col["authorized_user"]] || "").trim()
+    }))
+    .filter(r => r.account_id && r.authorized_user === activeUser);
+}
+
+function getAuthorizedGmbAccountIdSet_() {
+  return new Set(getAuthorizedGmbAccounts_().map(r => r.account_id));
+}
+
+function getAuthorizedGa4Properties_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(GRID_TABS.CONFIG_GA4);
+  if (!sh || sh.getLastRow() < 2) return [];
+
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(h => String(h || "").trim());
+  const col = {};
+  headers.forEach((h, i) => { if (h) col[h] = i; });
+
+  const req = ["ga4_account_name", "ga4_account_resource", "property_resource_name", "property_name", "authorized_user"];
+  const missing = req.filter(h => col[h] == null);
+  if (missing.length) throw new Error(`CONFIG_GA4 missing columns: ${missing.join(", ")}`);
+
+  const activeUser = getCurrentAuthorizedUserEmail_();
+  if (!activeUser) return [];
+
+  return sh.getRange(2, 1, sh.getLastRow() - 1, headers.length).getValues()
+    .map(r => ({
+      ga4_account_name: String(r[col["ga4_account_name"]] || "").trim(),
+      ga4_account_resource: String(r[col["ga4_account_resource"]] || "").trim(),
+      property_resource_name: String(r[col["property_resource_name"]] || "").trim(),
+      property_name: String(r[col["property_name"]] || "").trim(),
+      authorized_user: String(r[col["authorized_user"]] || "").trim()
+    }))
+    .filter(r => r.property_resource_name && r.authorized_user === activeUser);
+}
+
+/**
+ * Ensures all Grid config tabs exist, normalizes config/registry state, and creates or repairs destination files.
+ * This is the primary one-time initialization routine for the Grid environment.
+ */
+function gridInit() {
+  ensureGridTabs_();
+  normalizeGa4Config_();
+  normalizeSheetRegistry_();
+
+  const keys = Object.keys(DEST);
+  let createdOrRepaired = 0;
+
+  for (const k of keys) {
+    const d = DEST[k];
+    const before = getRegistrySpreadsheetId_(d.key);
+    const destSs = getOrCreateDest_(d);
+    const after = destSs.getId();
+
+    if (!before || before !== after) createdOrRepaired++;
+  }
+
+  dbg_("INFO", "INIT", "Grid init complete (idempotent; filled gaps only).", { repaired: createdOrRepaired });
+  return createdOrRepaired
+    ? `Init complete. Filled gaps: ${createdOrRepaired}`
+    : "Init complete. No gaps found.";
+}
+
+/**
+ * Rebuilds the Sheet Registry into the canonical column structure.
+ * This preserves existing rows while correcting header order and backfilling missing spreadsheet URLs.
+ */
+function normalizeSheetRegistry_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(GRID_TABS.SHEET_REGISTRY);
+  if (!sh) throw new Error(`Missing tab: ${GRID_TABS.SHEET_REGISTRY}`);
+
+  const CANON = ["dest_key","file_name","tab_name","spreadsheet_id","spreadsheet_url","created_utc","last_used_utc"];
+
+  const lastRow = sh.getLastRow();
+  const lastCol = Math.max(sh.getLastColumn(), CANON.length);
+
+  if (lastRow < 1) {
+    sh.getRange(1, 1, 1, CANON.length).setValues([CANON]);
+    return;
+  }
+
+  const row1 = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(v => String(v || "").trim());
+
+  const hasBlankHeaderCol = row1.some((h, i) => i < CANON.length && !h);
+  const isCanonical =
+    row1.length >= CANON.length &&
+    CANON.every((h, i) => row1[i] === h);
+
+  if (isCanonical && !hasBlankHeaderCol) return;
+
+  const data = (lastRow >= 2)
+    ? sh.getRange(2, 1, lastRow - 1, lastCol).getValues()
+    : [];
+
+  const col = {};
+  row1.forEach((h, i) => { if (h) col[h] = i; });
+
+  const pick = (r, names, fallbackIdx) => {
+    for (const n of names) {
+      if (col[n] != null) return r[col[n]];
+    }
+    return (fallbackIdx != null && r[fallbackIdx] !== undefined) ? r[fallbackIdx] : "";
+  };
+
+  const buildUrl_ = (id) => {
+    const sid = String(id || "").trim();
+    return sid ? `https://docs.google.com/spreadsheets/d/${sid}` : "";
+  };
+
+  const rebuilt = data.map(r => {
+    const destKey = String(pick(r, ["dest_key"], 0) || "").trim();
+    const fileName = String(pick(r, ["file_name"], 1) || "").trim();
+    const tabName = String(pick(r, ["tab_name"], 2) || "").trim();
+    const spreadsheetId = String(pick(r, ["spreadsheet_id"], 3) || "").trim();
+
+    let spreadsheetUrl = String(pick(r, ["spreadsheet_url","url","sheet_url"], 4) || "").trim();
+    if (!spreadsheetUrl && spreadsheetId) spreadsheetUrl = buildUrl_(spreadsheetId);
+
+    const createdUtc = String(pick(r, ["created_utc","created_at_utc"], 5) || "").trim();
+    const lastUsedUtc = String(pick(r, ["last_used_utc","last_seen_utc"], 6) || "").trim();
+
+    return [destKey, fileName, tabName, spreadsheetId, spreadsheetUrl, createdUtc, lastUsedUtc];
+  });
+
+  sh.clearContents();
+  sh.getRange(1, 1, 1, CANON.length).setValues([CANON]);
+  if (rebuilt.length) {
+    sh.getRange(2, 1, rebuilt.length, CANON.length).setValues(rebuilt);
+  }
+}
+
+/**
+ * Looks up and returns the spreadsheet_id for a destination key from the Sheet Registry.
+ * Returns a blank string when no matching row or required columns are found.
+ */
+function getRegistrySpreadsheetId_(destKey) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(GRID_TABS.SHEET_REGISTRY);
+  if (!sh) return "";
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return "";
+
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(h => String(h || "").trim());
+  const col = {};
+  headers.forEach((h, i) => { if (h) col[h] = i; });
+
+  const kCol = col["dest_key"];
+  const iCol = col["spreadsheet_id"];
+  if (kCol == null || iCol == null) return "";
+
+  const rows = sh.getRange(2, 1, lastRow - 1, sh.getLastColumn()).getValues();
+  for (const r of rows) {
+    if (String(r[kCol] || "").trim() === String(destKey || "").trim()) {
+      return String(r[iCol] || "").trim();
+    }
+  }
+  return "";
+}
+
+/**
+ * Makes sure a destination spreadsheet contains the expected tab name.
+ * It can rename an unprefixed tab, create the correct tab, hide duplicates, and remove the default Sheet1 when safe.
+ */
+function enforceDestTabName_(destSs, desiredTabName) {
+  const desired = String(desiredTabName || "").trim();
+  if (!desired) throw new Error("Missing desiredTabName");
+
+  const unprefixed = desired.startsWith(GRID_PREFIX)
+    ? desired.slice(GRID_PREFIX.length)
+    : desired;
+
+  let shDesired = destSs.getSheetByName(desired);
+  const shUnpref = destSs.getSheetByName(unprefixed);
+
+  if (!shDesired && shUnpref) {
+    shUnpref.setName(desired);
+    shDesired = shUnpref;
+  }
+
+  if (!shDesired) {
+    shDesired = destSs.insertSheet(desired);
+  }
+
+  const shUnprefNow = destSs.getSheetByName(unprefixed);
+  if (shUnprefNow && shUnprefNow.getName() !== shDesired.getName()) {
+    try { shUnprefNow.hideSheet(); } catch (e) {}
+  }
+
+  const sheets = destSs.getSheets();
+  if (sheets.length > 1) {
+    const sheet1 = destSs.getSheetByName("Sheet1");
+    if (sheet1 && sheet1.getName() !== desired) {
+      try { destSs.deleteSheet(sheet1); } catch (e) {}
+    }
+  }
+
+  return shDesired;
+}
+
+/**
+ * Ensures all required Grid config tabs exist in the active spreadsheet.
+ * Missing tabs are created by repurposing the first non-Grid tab when possible, otherwise by creating a new sheet.
+ */
+function ensureGridTabs_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const RESERVED = new Set(Object.values(GRID_TABS));
+
+  /**
+   * Creates or repurposes a sheet so it matches the required Grid tab name and headers.
+   * Existing matching tabs only get their header row refreshed.
+   */
+  function ensureGridTab_(tabName, headerRow) {
+    let sh = ss.getSheetByName(tabName);
+    if (sh) {
+      ensureHeaderRowOnly_(sh, headerRow);
+      return sh;
+    }
+
+    const candidate = ss.getSheets().find(s => !RESERVED.has(s.getName()));
+    if (candidate) {
+      candidate.setName(tabName);
+      ensureHeaderRowOnly_(candidate, headerRow);
+      return candidate;
+    }
+
+    sh = ss.insertSheet(tabName);
+    ensureHeaderRowOnly_(sh, headerRow);
+    return sh;
+  }
+
+  /**
+   * Writes only the header row into a given sheet without clearing the full sheet.
+   * This keeps the structure aligned without wiping all data.
+   */
+  function ensureHeaderRowOnly_(sheet, headerRow) {
+    sheet.getRange(1, 1, 1, headerRow.length).setValues([headerRow]);
+  }
+
+  ensureGridTab_(GRID_TABS.CONFIG_GMB, [
+    "account_name","account_id","type","role","first_seen_utc","last_seen_utc","backfill_months","authorized_user"
+  ]);
+
+  ensureGridTab_(GRID_TABS.CONFIG_GA4, [
+    "property_resource_name","property_name","ga4_account_resource","ga4_account_name","first_seen_utc","last_seen_utc","backfill_months","authorized_user"
+  ]);
+
+  ensureGridTab_(GRID_TABS.SHEET_REGISTRY, [
+    "dest_key","file_name","tab_name","spreadsheet_id","spreadsheet_url","created_utc","last_used_utc"
+  ]);
+
+  ensureGridTab_(GRID_TABS.PULL_HISTORY, [
+    "pulled_utc","dataset_key","entity_key","range_start","range_end","rows_added","errors_count","notes"
+  ]);
+
+  ensureGridTab_(GRID_TABS.DEBUG_LOG, [
+    "ts_utc","level","context","message","json"
+  ]);
+
+  ensureGridTab_(GRID_TABS.COMMAND_REGISTRY, [
+    "Function Name","Status","Description"
+  ]);
+
+  ensureGridTab_(GRID_TABS.API_USAGE, [
+    "Date","Dataset","Total Api Calls", "Called Api's Names"
+  ]);
+}
+
+/**
+ * Repairs rows in the GA4 config tab when values are shifted into the wrong columns.
+ * This is safe to run repeatedly and only updates rows that match known skew patterns.
+ */
+function normalizeGa4Config_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(GRID_TABS.CONFIG_GA4);
+  if (!sh) throw new Error(`Missing tab: ${GRID_TABS.CONFIG_GA4}`);
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if (lastRow < 2) return "normalizeGa4Config_: no rows";
+
+  const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h || "").trim());
+  const col = {};
+  headers.forEach((h, i) => { if (h) col[h] = i; });
+
+  const need = ["property_resource_name","property_name","ga4_account_resource","ga4_account_name"];
+  const miss = need.filter(h => col[h] == null);
+  if (miss.length) throw new Error(`GA4 config missing columns: ${miss.join(", ")}\nFound: ${headers.join(" | ")}`);
+
+  const data = sh.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+  const isProp = (v) => /^properties\/\d+$/.test(String(v || "").trim());
+  const isAcct = (v) => /^accounts\/\d+$/.test(String(v || "").trim());
+
+  let fixes = 0;
+
+  for (let r = 0; r < data.length; r++) {
+    const row = data[r];
+
+    const A = String(row[col["property_resource_name"]] || "").trim();
+    const B = String(row[col["property_name"]] || "").trim();
+    const C = String(row[col["ga4_account_resource"]] || "").trim();
+    const D = String(row[col["ga4_account_name"]] || "").trim();
+
+    if (isProp(A) && isAcct(C)) continue;
+
+    const looksLikeYourSkew =
+      isProp(D) && isAcct(B) && !isProp(A) && !isAcct(C);
+
+    if (looksLikeYourSkew) {
+      row[col["property_resource_name"]] = D;
+      row[col["property_name"]] = C;
+      row[col["ga4_account_resource"]] = B;
+      row[col["ga4_account_name"]] = A;
+      fixes++;
+      continue;
+    }
+
+    if (!isProp(A)) {
+      if (isProp(C) && !isAcct(C)) {
+        row[col["property_resource_name"]] = C;
+        row[col["property_name"]] = B || row[col["property_name"]];
+        row[col["ga4_account_resource"]] = A;
+        row[col["ga4_account_name"]] = D || row[col["ga4_account_name"]];
+        fixes++;
+        continue;
+      }
+      if (isProp(D)) {
+        row[col["property_resource_name"]] = D;
+        fixes++;
+        continue;
+      }
+    }
+  }
+
+  if (fixes) {
+    sh.getRange(2, 1, data.length, lastCol).setValues(data);
+  }
+
+  return `normalizeGa4Config_: fixed ${fixes} row(s)`;
+}
+
+/**
+ * Retrieves an existing destination spreadsheet from the registry or creates and registers it if missing.
+ * Also repairs missing tabs, missing IDs, deleted files, and backfills spreadsheet URLs.
+ */
+function getOrCreateDest_(destObj) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const reg = ss.getSheetByName(GRID_TABS.SHEET_REGISTRY);
+  if (!reg) throw new Error(`Missing sheet: ${GRID_TABS.SHEET_REGISTRY}`);
+
+  const now = new Date().toISOString();
+  const CANON = ["dest_key","file_name","tab_name","spreadsheet_id","spreadsheet_url","created_utc","last_used_utc"];
+
+  const buildUrl_ = (id) => {
+    const sid = String(id || "").trim();
+    return sid ? `https://docs.google.com/spreadsheets/d/${sid}` : "";
+  };
+
+  const lastRow = reg.getLastRow();
+  const lastCol = Math.max(reg.getLastColumn(), CANON.length);
+
+  const headers = reg.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h || "").trim());
+  const col = {};
+  headers.forEach((h, i) => { if (h) col[h] = i; });
+
+  const idx = (name, fallback) => (col[name] != null ? col[name] : fallback);
+
+  const kCol = idx("dest_key", 0);
+  const fCol = idx("file_name", 1);
+  const tCol = idx("tab_name", 2);
+  const iCol = idx("spreadsheet_id", 3);
+  const urlCol = idx("spreadsheet_url", 4);
+  const cCol = idx("created_utc", 5);
+  const uCol = idx("last_used_utc", 6);
+
+  let rowNum = -1;
+  let spreadsheetId = "";
+  let spreadsheetUrl = "";
+
+  if (lastRow >= 2) {
+    const rows = reg.getRange(2, 1, lastRow - 1, lastCol).getValues();
+    for (let i = 0; i < rows.length; i++) {
+      const key = String(rows[i][kCol] || "").trim();
+      if (key === destObj.key) {
+        rowNum = i + 2;
+        spreadsheetId = String(rows[i][iCol] || "").trim();
+        spreadsheetUrl = (urlCol != null) ? String(rows[i][urlCol] || "").trim() : "";
+        break;
+      }
+    }
+  }
+
+  if (rowNum > 0 && !spreadsheetId) {
+    const file = SpreadsheetApp.create(destObj.fileName);
+    spreadsheetId = file.getId();
+    spreadsheetUrl = buildUrl_(spreadsheetId);
+
+    reg.getRange(rowNum, fCol + 1).setValue(destObj.fileName);
+    reg.getRange(rowNum, tCol + 1).setValue(destObj.tabName);
+    reg.getRange(rowNum, iCol + 1).setValue(spreadsheetId);
+    if (urlCol != null) reg.getRange(rowNum, urlCol + 1).setValue(spreadsheetUrl);
+    reg.getRange(rowNum, cCol + 1).setValue(now);
+    reg.getRange(rowNum, uCol + 1).setValue(now);
+
+    const destSs = SpreadsheetApp.openById(spreadsheetId);
+    enforceDestTabName_(destSs, destObj.tabName);
+    return destSs;
+  }
+
+  if (rowNum > 0 && spreadsheetId) {
+    try {
+      const destSs = SpreadsheetApp.openById(spreadsheetId);
+      enforceDestTabName_(destSs, destObj.tabName);
+
+      if (urlCol != null) {
+        spreadsheetUrl = spreadsheetUrl || buildUrl_(spreadsheetId);
+        reg.getRange(rowNum, urlCol + 1).setValue(spreadsheetUrl);
+      }
+
+      reg.getRange(rowNum, uCol + 1).setValue(now);
+      return destSs;
+
+    } catch (e) {
+      const file = SpreadsheetApp.create(destObj.fileName);
+      spreadsheetId = file.getId();
+      spreadsheetUrl = buildUrl_(spreadsheetId);
+
+      reg.getRange(rowNum, fCol + 1).setValue(destObj.fileName);
+      reg.getRange(rowNum, tCol + 1).setValue(destObj.tabName);
+      reg.getRange(rowNum, iCol + 1).setValue(spreadsheetId);
+      if (urlCol != null) reg.getRange(rowNum, urlCol + 1).setValue(spreadsheetUrl);
+      reg.getRange(rowNum, cCol + 1).setValue(now);
+      reg.getRange(rowNum, uCol + 1).setValue(now);
+
+      const destSs = SpreadsheetApp.openById(spreadsheetId);
+      enforceDestTabName_(destSs, destObj.tabName);
+      return destSs;
+    }
+  }
+
+  const file = SpreadsheetApp.create(destObj.fileName);
+  spreadsheetId = file.getId();
+  spreadsheetUrl = buildUrl_(spreadsheetId);
+
+  const destSs = SpreadsheetApp.openById(spreadsheetId);
+  enforceDestTabName_(destSs, destObj.tabName);
+
+  reg.getRange(reg.getLastRow() + 1, 1, 1, CANON.length).setValues([[
+    destObj.key,
+    destObj.fileName,
+    destObj.tabName,
+    spreadsheetId,
+    spreadsheetUrl,
+    now,
+    now
+  ]]);
+
+  return destSs;
+}
+
+/**
+ * Appends a log row to the Debug Log tab with optional JSON payload details.
+ * Failures inside the logger are swallowed to avoid interrupting normal execution.
+ */
+function dbg_(level, context, message, obj) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sh = ss.getSheetByName(GRID_TABS.DEBUG_LOG);
+    if (!sh) return;
+
+    sh.getRange(1, 1, 1, 5).setValues([[
+      "ts_utc", "level", "context", "message", "json"
+    ]]);
+
+    let json = "";
+    try {
+      json = obj ? JSON.stringify(obj).slice(0, 45000) : "";
+    } catch (e) {
+      json = String(obj || "").slice(0, 45000);
+    }
+
+    sh.getRange(sh.getLastRow() + 1, 1, 1, 5).setValues([[
+      new Date().toISOString(),
+      String(level || "INFO"),
+      String(context || ""),
+      String(message || ""),
+      json
+    ]]);
+  } catch (e) {}
+}
+
+/**
+ * Creates the project triggers needed for scheduled runs and rebuilds the command registry.
+ * This prepares the spreadsheet for routine execution without creating destination spreadsheets.
+ */
+function setupCommand() {
+  ensureGridTabs_();
+  normalizeGa4Config_();
+  const existing = ScriptApp.getProjectTriggers();
+  const has = (handler) => existing.some(t => t.getHandlerFunction() === handler);
+
+  buildCommandRegistry_();
+
+  dbg_("INFO", "SETUP", "SETUP COMMAND completed. Triggers ensured + command registry rebuilt.");
+
+  return "SETUP COMMAND complete.\nTriggers ensured.\nCommand Registry updated.";
+}
+
+/**
+ * Rewrites the Command Registry tab with the list of available runnable functions.
+ * This gives the sidebar and spreadsheet a clean source of command metadata.
+ */
+function buildCommandRegistry_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(GRID_TABS.COMMAND_REGISTRY);
+  if (!sh) throw new Error(`Missing sheet: ${GRID_TABS.COMMAND_REGISTRY} (run gridInit)`);
+
+  const allowedCommands = [
+    "gridInit",
+    "setupCommand",
+    "setAuth",
+    "resetAuth",
+    
+    "setDailyCadence",
+    "setMonthlyCadence",
+    "runFullCadence",
+    "pauseCadence",
+
+
+    "manualRefreshAll",
+    "accountsRefresh",
+    "extractSearchTerms",
+    "extractKeywordCompetitorRanks",
+    "extractLocationsOverview",
+    "extractLocationDetails",
+    "extractPerformanceOverview",
+    "extractPostsOverview",
+    "extractReviewsOverview",
+    "extractGa4Sessions",
+    "extractGa4Events"
+  ];
+
+  const descriptions = {
+    gridInit: "Create and repair GRID tabs and destinations.",
+    setupCommand: "Rebuild commands and prepare scheduled runs.",
+    setAuth: "Start Google OAuth authorization.",
+    resetAuth: "Clear saved OAuth credentials.",
+    setDailyCadence: "Run full cadence daily.",
+    setMonthlyCadence: "Run full cadence monthly.",
+    runFullCadence: "Run all scheduled extractors.",
+    pauseCadence: "Remove active cadence triggers.",
+    manualRefreshAll: "Run all main extractors now.",
+    accountsRefresh: "Refresh GMB and GA4 account configs.",
+    extractSearchTerms: "Pull monthly GBP search terms.",
+    extractKeywordCompetitorRanks: "Rank competitors for keyword searches.",
+    extractLocationsOverview: "Pull GBP location overview data.",
+    extractLocationDetails: "Pull enriched GBP location details.",
+    extractPerformanceOverview: "Pull GBP performance metrics.",
+    extractPostsOverview: "Pull GBP local posts.",
+    extractReviewsOverview: "Pull and update GBP reviews.",
+    extractGa4Sessions: "Pull monthly GA4 session data.",
+    extractGa4Events: "Pull monthly GA4 event data."
+  };
+
+  sh.getRange(1, 1, 1, 3).setValues([["Function Name", "Status", "Description"]]);
+
+  const rows = allowedCommands.map(fn => [fn, "Available", descriptions[fn] || ""]);
+  if (rows.length) {
+    sh.getRange(2, 1, rows.length, 3).setValues(rows);
+  }
+
+  try { sh.autoResizeColumns(1, 3); } catch (e) {}
+}
+
+/**
+ * Runs the full manual refresh sequence across all major extractors and support routines.
+ * Each step is logged, surfaced in a popup, and captured in the returned output block.
+ */
+function manualRefreshAll() {
+  ensureGridTabs_();
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const steps = [
+    ["accountsRefresh",     "Hourly Accounts Refresh"],
+    ["extractLocationsOverview",  "Locations Overview"],
+    ["extractLocationDetails",    "Location Details"],
+    ["extractPerformanceOverview","Performance Overview"],
+    ["extractSearchTerms",        "Search Terms Overview"],
+    ["extractKeywordCompetitorRanks","Keyword Competitor"],
+    ["extractPostsOverview",      "Posts Overview"],
+    ["extractReviewsOverview",    "Reviews Overview"],
+    ["extractGa4Sessions",        "GA4 Sessions"],
+    ["extractGa4Events",          "GA4 Events"]
+  ];
+
+  const lines = [];
+  let errors = 0;
+
+  ss.toast("Manual Refresh: starting…", "GRID", 5);
+  dbg_("INFO", "MANUAL_REFRESH", "Manual refresh started", { steps: steps.map(s => s[0]) });
+
+  for (let i = 0; i < steps.length; i++) {
+    const fn = steps[i][0];
+    const label = steps[i][1];
+
+    lines.push(`GRID> Executing ${fn}`);
+
+    try {
+      if (typeof this[fn] !== "function") throw new Error(`Missing function: ${fn}`);
+      const res = this[fn]();
+
+      lines.push(`GRID> Complete ${fn}`);
+      lines.push(`OK  | ${label}`);
+      if (res) lines.push(String(res).slice(0, 1200));
+
+    } catch (e) {
+      errors++;
+      const msg = String(e && e.message ? e.message : e);
+
+      lines.push(`GRID> ERROR ${fn}: ${msg}`);
+      lines.push(`ERR | ${label} | ${msg}`);
+
+      dbg_("ERROR", "MANUAL_REFRESH", `Step failed: ${fn}`, { err: String(e && e.stack ? e.stack : e) });
+    }
+  }
+
+  dbg_("INFO", "MANUAL_REFRESH", "Manual refresh completed", { errors });
+  ss.toast(`Manual Refresh: complete\nErrors: ${errors}`, "GRID", 6);
+
+  SpreadsheetApp.getUi().alert(lines.join("\n"));
+  return lines.join("\n");
+}
+
+
+/**
+ * Writes a header row to the destination sheet using the supplied header list.
+ * This helper is used when a destination sheet needs its schema initialized.
+ */
+function gridEnsureHeaderRowOnly_(sheet, headers) {
+  if (!headers || !headers.length) throw new Error("Headers array is empty.");
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+}
+
+/**
+ * Reads the first row of a sheet and returns both the raw headers and a name-to-index map.
+ * This makes downstream column lookup logic easier and consistent.
+ */
+function gridMapHeaders_(sheet) {
+  const lastCol = sheet.getLastColumn();
+  if (lastCol < 1) return { headers: [], col: {} };
+
+  const headers = sheet
+    .getRange(1, 1, 1, lastCol)
+    .getValues()[0]
+    .map(h => String(h || "").trim());
+
+  const col = {};
+  headers.forEach((h, i) => {
+    if (h) col[h] = i;
+  });
+
+  return { headers, col };
+}
+
+/**
+ * Builds a set of composite keys from existing destination rows using the specified key columns.
+ * This is typically used to support deduping during appends.
+ */
+function gridBuildExistingKeys_(sheet, keyCols) {
+  const { headers, col } = gridMapHeaders_(sheet);
+
+  const missing = (keyCols || []).filter(k => col[k] == null);
+  if (missing.length) throw new Error(`Dest sheet missing key columns: ${missing.join(", ")}`);
+
+  const keys = new Set();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return keys;
+
+  const data = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  data.forEach(r => {
+    const parts = keyCols.map(k => String(r[col[k]] || "").trim());
+    if (parts.every(Boolean)) keys.add(parts.join("|"));
+  });
+
+  return keys;
+}
+
+/**
+ * Ensures a destination sheet has headers when the file is empty or row 1 is blank.
+ * If headers already exist, the function leaves the sheet untouched.
+ */
+function gridEnsureDestHeaders_(destKey, headers) {
+  const d = gridGetDestSheet_(destKey);
+
+  const lastRow = d.sh.getLastRow();
+  const lastCol = d.sh.getLastColumn();
+
+  if (lastRow < 1 || lastCol < 1) {
+    gridEnsureHeaderRowOnly_(d.sh, headers);
+    return d;
+  }
+
+  const row1 = d.sh.getRange(1, 1, 1, Math.max(lastCol, headers.length)).getValues()[0];
+  const hasAny = row1.some(v => String(v || "").trim() !== "");
+  if (!hasAny) gridEnsureHeaderRowOnly_(d.sh, headers);
+
+  return d;
+}
+
+/**
+ * Appends a single standardized row to the Pull History tab.
+ * This records dataset pulls, row counts, date ranges, and error totals.
+ */
+function pullHistoryAppendRow_(o) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(GRID_TABS.PULL_HISTORY);
+  if (!sh) return;
+
+  const row = [
+    new Date().toISOString(),
+    String(o.dataset_key || ""),
+    String(o.entity_key || ""),
+    String(o.range_start || ""),
+    String(o.range_end || ""),
+    Number(o.rows_added || 0),
+    Number(o.errors_count || 0),
+    String(o.notes || "")
+  ];
+
+  sh.getRange(sh.getLastRow() + 1, 1, 1, row.length).setValues([row]);
+}
+
+function logApiUsage_(date, dataset, totalCalls, apiSummary) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sh = ss.getSheetByName(GRID_TABS.API_USAGE);
+    if (!sh) return;
+
+    // Ensure headers (safe overwrite like dbg_)
+    sh.getRange(1, 1, 1, 4).setValues([[
+      "Date",
+      "Dataset",
+      "Total Api Calls",
+      "Called Api's Names"
+    ]]);
+
+    sh.getRange(sh.getLastRow() + 1, 1, 1, 4).setValues([[
+      String(date || ""),
+      String(dataset || ""),
+      Number(totalCalls || 0),
+      String(apiSummary || "")
+    ]]);
+
+  } catch (e) {
+    // silent fail (same philosophy as dbg_)
+  }
+}
+
+function runFullCadence() {
+  ensureGridTabs_();
+
+  const steps = [
+    "accountsRefresh",     
+    "extractLocationsOverview",
+    "extractLocationDetails",
+    "extractPerformanceOverview",
+    "extractSearchTerms",
+    "extractKeywordCompetitorRanks",
+    "extractPostsOverview",
+    "extractReviewsOverview",
+    "extractGa4Sessions",
+    "extractGa4Events"
+  ];
+
+  dbg_("INFO", "CADENCE", "Full cadence started", { steps });
+
+  let errors = 0;
+
+  for (const fn of steps) {
+    try {
+      if (typeof this[fn] !== "function") {
+        throw new Error(`Missing function: ${fn}`);
+      }
+
+      this[fn]();
+
+    } catch (e) {
+      errors++;
+      dbg_("ERROR", "CADENCE", `Step failed: ${fn}`, {
+        err: String(e && e.stack ? e.stack : e)
+      });
+    }
+  }
+
+  dbg_("INFO", "CADENCE", "Full cadence completed", { errors });
+
+  return `runFullCadence complete. Errors: ${errors}`;
+}
+
+function pauseCadence() {
+  const triggers = ScriptApp.getProjectTriggers();
+  let removed = 0;
+
+  triggers.forEach(trigger => {
+    try {
+      ScriptApp.deleteTrigger(trigger);
+      removed++;
+    } catch (e) {
+      dbg_("ERROR", "CADENCE", "Failed to delete trigger during pauseCadence", {
+        handler: trigger.getHandlerFunction ? trigger.getHandlerFunction() : "",
+        err: String(e && e.stack ? e.stack : e)
+      });
+    }
+  });
+
+  dbg_("INFO", "CADENCE", "All timed cadences paused", { removed });
+
+  return `pauseCadence complete. Triggers removed: ${removed}`;
+}
+
+function setDailyCadence() {
+  pauseCadence();
+
+  ScriptApp.newTrigger("runFullCadence")
+    .timeBased()
+    .everyDays(1)
+    .atHour(3)
+    .create();
+
+  dbg_("INFO", "CADENCE", "Daily cadence installed", {
+    handler: "runFullCadence",
+    frequency: "daily",
+    hour: 3
+  });
+
+  return "setDailyCadence complete. runFullCadence will run daily at 3 AM.";
+}
+
+function setMonthlyCadence() {
+  pauseCadence();
+
+  ScriptApp.newTrigger("runFullCadence")
+    .timeBased()
+    .onMonthDay(1)
+    .atHour(3)
+    .create();
+
+  dbg_("INFO", "CADENCE", "Monthly cadence installed", {
+    handler: "runFullCadence",
+    frequency: "monthly",
+    day: 1,
+    hour: 3
+  });
+
+  return "setMonthlyCadence complete. runFullCadence will run on the 1st of each month at 3 AM.";
+}
+
+/**
+ * Returns the full HTML markup used to render the Tron-style GRID sidebar.
+ * This includes the layout, styling, and embedded client-side command console logic.
+ */
+function getGridSidebarHtml_() {
+  const initialAuthState = JSON.stringify(getAuthUiState())
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e");
+
+  return `<!doctype html>
+<html>
+<head>
+  <base target="_top">
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root{
+      --bg0:#05070d;
+      --bg1:#070b16;
+      --line:rgba(0,229,255,.22);
+      --line2:rgba(58,160,255,.14);
+      --cyan:#00e5ff;
+      --blue:#3aa0ff;
+      --text:#d7fbff;
+      --muted:rgba(215,251,255,.72);
+      --warn:#ffcc66;
+      --ok:#59f7c6;
+      --glow:rgba(0,229,255,.55);
+      --space-1:clamp(8px, 1.6vw, 12px);
+      --space-2:clamp(10px, 2vw, 14px);
+      --radius-1:clamp(12px, 2vw, 14px);
+      --title-size:clamp(16px, 3.4vw, 18px);
+      --body-size:clamp(11px, 2.2vw, 12px);
+      --label-size:clamp(10px, 1.8vw, 11px);
+      --status-dot-size:8px;
+    }
+
+    *{ box-sizing:border-box; }
+    html,body{
+      height:100%;
+      margin:0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;
+      color:var(--text);
+      background:
+        radial-gradient(900px 500px at 30% 10%, rgba(0,229,255,.12), transparent 55%),
+        radial-gradient(800px 450px at 90% 25%, rgba(58,160,255,.10), transparent 55%),
+        linear-gradient(180deg, var(--bg0), var(--bg1));
+      overflow-x:hidden;
+      overflow-y:auto;
+    }
+
+    .scan{
+      position:absolute; inset:-80px;
+      background-image:
+        linear-gradient(rgba(0,229,255,.10) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0,229,255,.06) 1px, transparent 1px);
+      background-size: 34px 34px, 34px 34px;
+      transform: perspective(900px) rotateX(68deg) translateY(40px);
+      transform-origin: center;
+      filter: drop-shadow(0 0 16px rgba(0,229,255,.22));
+      animation: drift 9s linear infinite;
+      opacity:.75;
+      pointer-events:none;
+    }
+    @keyframes drift {
+      from { background-position: 0 0, 0 0; }
+      to   { background-position: 0 160px, 160px 0; }
+    }
+
+    .rail{
+      position:absolute; left:0; top:0; bottom:0;
+      width:3px;
+      background: linear-gradient(180deg, rgba(0,229,255,0), rgba(0,229,255,.55), rgba(58,160,255,.45), rgba(0,229,255,0));
+      box-shadow: 0 0 16px rgba(0,229,255,.22);
+      opacity:.85;
+      pointer-events:none;
+    }
+
+    .wrap{
+      position:relative;
+      min-height:100%;
+      padding: var(--space-2) var(--space-1) var(--space-1);
+      display:flex;
+      flex-direction:column;
+      gap:var(--space-1);
+    }
+
+    .topbar{
+      border:1px solid var(--line);
+      border-radius: var(--radius-1);
+      background: linear-gradient(180deg, rgba(7,19,37,.78), rgba(7,19,37,.55));
+      box-shadow: 0 0 0 1px rgba(58,160,255,.08) inset, 0 0 22px rgba(0,229,255,.10);
+      padding: var(--space-1) var(--space-1) clamp(8px, 1.6vw, 10px);
+      position:relative;
+      overflow:hidden;
+      flex:0 0 auto;
+    }
+
+    .topbar:before{
+      content:"";
+      position:absolute; inset:-2px;
+      background: linear-gradient(90deg, transparent, rgba(0,229,255,.18), transparent);
+      transform: translateX(-70%);
+      animation: sweep 4.32s ease-in-out infinite;
+      pointer-events:none;
+      opacity:.9;
+    }
+    @keyframes sweep{
+      0% { transform: translateX(-70%); opacity:.0; }
+      18%{ opacity:.9; }
+      60%{ opacity:.9; }
+      100%{ transform: translateX(70%); opacity:.0; }
+    }
+
+    .brandRow{
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap:var(--space-1);
+      flex-wrap:wrap;
+    }
+
+    .title{
+      font-weight:800;
+      font-size: var(--title-size);
+      text-transform:uppercase;
+      text-shadow: 0 0 14px rgba(0,229,255,.22);
+      line-height:1.05;
+      letter-spacing:.12em;
+      overflow-wrap:anywhere;
+    }
+
+    .subtitle{
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif;
+      font-size: var(--body-size);
+      color: var(--muted);
+      letter-spacing:.03em;
+      line-height:1.25;
+      margin-top:clamp(6px, 1.2vw, 8px);
+    }
+    .subtitle strong{
+      color:var(--text);
+      font-weight:650;
+    }
+
+    .statusPill{
+      flex:0 0 auto;
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:6px 10px;
+      border-radius: 999px;
+      border:1px solid rgba(0,229,255,.30);
+      background: rgba(0,229,255,.06);
+      font-size: var(--label-size);
+      letter-spacing:.10em;
+      text-transform:uppercase;
+      color: var(--muted);
+      box-shadow: 0 0 18px rgba(0,229,255,.08);
+      user-select:none;
+      margin-top:2px;
+      max-width:100%;
+    }
+    .statusPill.offline{
+      border-color: rgba(255,255,255,.14);
+      background: rgba(255,255,255,.04);
+      box-shadow: 0 0 12px rgba(255,255,255,.04);
+      color: rgba(215,251,255,.58);
+    }
+    .dot{
+      width:var(--status-dot-size); height:var(--status-dot-size);
+      border-radius:999px;
+      background: var(--cyan);
+      box-shadow: 0 0 12px var(--glow);
+      animation:pulse 4.32s ease-in-out infinite;
+    }
+    .statusPill.offline .dot{
+      background: rgba(215,251,255,.34);
+      box-shadow:none;
+      animation:none;
+      opacity:.8;
+    }
+    @keyframes pulse{
+      0%,100%{ transform:scale(1); opacity:.65; }
+      50%{ transform:scale(1.35); opacity:1; }
+    }
+
+    .section{
+      border:1px solid var(--line2);
+      border-radius: var(--radius-1);
+      background: linear-gradient(180deg, rgba(6,12,24,.70), rgba(6,12,24,.45));
+      box-shadow: 0 0 0 1px rgba(58,160,255,.06) inset;
+      padding: var(--space-1);
+      overflow:hidden;
+      display:flex;
+      flex-direction:column;
+      flex:0 0 auto;
+    }
+
+    .sectionHeader{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:var(--space-1);
+      margin-bottom:var(--space-1);
+      flex-wrap:wrap;
+    }
+
+    .label{
+      font-size:var(--label-size);
+      letter-spacing:.16em;
+      text-transform:uppercase;
+      color: rgba(215,251,255,.78);
+    }
+
+    .terminal{
+      border-radius: 12px;
+      border:1px solid rgba(0,229,255,.18);
+      background: rgba(0,0,0,.25);
+      padding:10px 10px 8px;
+      min-height:clamp(150px, 34vh, 220px);
+      max-height:260px;
+      min-width:0;
+      overflow:auto;
+      line-height:1.35;
+      font-size: var(--body-size);
+      box-shadow: 0 0 18px rgba(0,229,255,.06);
+    }
+
+    .line{ display:flex; gap:8px; margin:0 0 6px 0; }
+    .prompt{ color: rgba(0,229,255,.85); }
+    .msg{ color: rgba(215,251,255,.80); overflow-wrap:anywhere; }
+    .ok{ color: var(--ok); }
+    .warn{ color: var(--warn); }
+
+    input{
+      width:100%;
+      border:1px solid rgba(0,229,255,.22);
+      border-radius: 12px;
+      padding:10px 12px;
+      background: rgba(0,0,0,.22);
+      color: var(--text);
+      outline:none;
+      font-family: inherit;
+      font-size: var(--body-size);
+      margin-top:var(--space-1);
+    }
+    input::placeholder{ color: rgba(215,251,255,.40); }
+
+    .btnRow{
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap:var(--space-1);
+      margin-top:var(--space-1);
+      width:100%;
+    }
+
+    button{
+      appearance:none;
+      width:100%;
+      min-width:0;
+      border:1px solid rgba(0,229,255,.35);
+      background: linear-gradient(180deg, rgba(0,229,255,.12), rgba(0,229,255,.05));
+      color: var(--text);
+      padding:10px 10px;
+      border-radius: 12px;
+      font-weight: 800;
+      letter-spacing:.08em;
+      text-transform:uppercase;
+      cursor:pointer;
+      box-shadow: 0 0 18px rgba(0,229,255,.10);
+      transition: transform .08s ease, box-shadow .15s ease, border-color .15s ease;
+      font-size: var(--label-size);
+      white-space: normal;
+      text-align:center;
+      overflow:hidden;
+      text-wrap:balance;
+    }
+    button:hover{
+      border-color: rgba(0,229,255,.55);
+      box-shadow: 0 0 22px rgba(0,229,255,.16);
+    }
+    button:active{ transform: translateY(1px); }
+
+    .ghost{
+      border-color: rgba(58,160,255,.26);
+      background: linear-gradient(180deg, rgba(58,160,255,.10), rgba(58,160,255,.05));
+    }
+
+    .footer{
+      margin-top:auto;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", sans-serif;
+      font-size: var(--label-size);
+      color: rgba(215,251,255,.55);
+      padding: 2px 2px 0;
+      line-height:1.35;
+      flex:0 0 auto;
+    }
+
+    @media (max-width: 360px){
+      .btnRow{
+        grid-template-columns: 1fr;
+      }
+
+      .statusPill{
+        width:100%;
+        justify-content:center;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="scan"></div>
+  <div class="rail"></div>
+
+  <div class="wrap">
+    <div class="topbar">
+      <div class="brandRow">
+        <div style="min-width:0">
+          <div class="title">
+            WELCOME<br>
+            TO THE<br>
+            GRID
+          </div>
+          <div class="subtitle"><strong>GMB &amp; GA4 Raw Insight Delivery</strong></div>
+        </div>
+        <div class="statusPill offline" id="authStatus"><span class="dot"></span><span id="authStatusLabel">Offline</span></div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="sectionHeader">
+        <div class="label">SYSTEM CONSOLE</div>
+        <div class="label" style="opacity:.7">CMD</div>
+      </div>
+
+      <div class="terminal" id="term"></div>
+
+      <input id="cmd" placeholder="Click a command button or type a function (e.g., gridInit), then press RUN" />
+
+      <div class="btnRow">
+        <button onclick="runCmd()">RUN</button>
+        <button class="ghost" onclick="clearTerm()">CLEAR</button>
+      </div>
+
+      <div class="btnRow">
+        <button class="ghost" style="grid-column:1 / -1" onclick="quick('setAuth')">GO ONLINE</button>
+      </div>
+
+      <div class="btnRow">
+        <button class="ghost" onclick="quick('gridInit')">INIT GRID</button>
+        <button class="ghost" onclick="quick('setupCommand')">SETUP COMMAND</button>
+      </div>
+
+      <div class="btnRow">
+        <button class="ghost" onclick="quick('manualRefreshAll')">MANUAL REFRESH</button>
+        <button class="ghost" onclick="google.script.host.close()">CLOSE</button>
+      </div>
+    </div>
+
+    <div class="footer">
+      If it doesn’t auto-open, use <span style="color:rgba(0,229,255,.85)">GRID → Open Interface</span>.
+    </div>
+  </div>
+
+  <script>
+    const INITIAL_AUTH_STATE = ${initialAuthState};
+    const term = document.getElementById('term');
+    const cmd = document.getElementById('cmd');
+    const authStatus = document.getElementById('authStatus');
+    const authStatusLabel = document.getElementById('authStatusLabel');
+
+    function escapeHtml(s){
+      return String(s).replace(/[&<>"']/g, c => ({
+        "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+      }[c]));
+    }
+
+    function append(lineHtml){
+      const d = document.createElement('div');
+      d.innerHTML = lineHtml;
+      term.appendChild(d.firstChild);
+      term.scrollTop = term.scrollHeight;
+    }
+
+    function setAuthStatus(state){
+      const authorized = !!(state && state.authorized);
+      const label = (state && state.label) ? state.label : (authorized ? "Online User: User" : "Offline");
+      authStatus.classList.toggle('offline', !authorized);
+      authStatusLabel.textContent = label;
+    }
+
+    function refreshAuthStatus(){
+      google.script.run
+        .withSuccessHandler((state) => {
+          setAuthStatus(state);
+        })
+        .withFailureHandler(() => {
+          setAuthStatus({ authorized:false, label:"Offline" });
+        })
+        .getAuthUiState();
+    }
+
+    function boot(){
+      const lines = [
+        "Boot sequence initiated…",
+        "Linking GMB signals… OK",
+        "Linking GA4 events… OK",
+        "Retention layer… READY",
+        "Click a command, then press RUN."
+      ];
+
+      let i = 0;
+      const tick = () => {
+        if (i >= lines.length) return;
+        const txt = lines[i++];
+        append('<div class="line"><span class="prompt">GRID&gt;</span><span class="msg">' +
+          txt.replace("OK", '<span class="ok">OK</span>').replace("READY", '<span class="ok">READY</span>') +
+        '</span></div>');
+        setTimeout(tick, 220);
+      };
+      tick();
+    }
+
+    function clearTerm(){
+      term.innerHTML = "";
+      boot();
+    }
+
+    function quick(name){
+      cmd.value = name;
+      cmd.focus();
+      append('<div class="line"><span class="prompt">GRID&gt;</span><span class="msg">Queued <span class="ok">' +
+        escapeHtml(name) + '</span>. Press RUN.</span></div>');
+    }
+
+    function runCmd(){
+      const fnName = (cmd.value || "").trim();
+      if (!fnName){
+        append('<div class="line"><span class="prompt">GRID&gt;</span><span class="msg"><span class="warn">ERROR</span> Enter a command.</span></div>');
+        return;
+      }
+
+      append('<div class="line"><span class="prompt">GRID&gt;</span><span class="msg">Executing <span class="ok">' +
+        escapeHtml(fnName) + '</span>…</span></div>');
+
+      google.script.run
+        .withSuccessHandler((res) => {
+          append('<div class="line"><span class="prompt">GRID&gt;</span><span class="msg"><span class="ok">DONE</span> ' +
+            escapeHtml(fnName) + '</span></div>');
+          if (res) {
+            append('<div class="line"><span class="prompt">GRID&gt;</span><span class="msg">' + escapeHtml(res) + '</span></div>');
+          }
+          refreshAuthStatus();
+        })
+        .withFailureHandler((err) => {
+          const msg = (err && err.message) ? err.message : String(err || "Unknown error");
+          append('<div class="line"><span class="prompt">GRID&gt;</span><span class="msg"><span class="warn">ERROR</span> ' +
+            escapeHtml(msg) + '</span></div>');
+          refreshAuthStatus();
+        })
+        .GRID_run(fnName);
+    }
+
+    boot();
+    setAuthStatus(INITIAL_AUTH_STATE);
+    setInterval(refreshAuthStatus, 30000);
+    cmd.addEventListener("keydown", (e) => { if (e.key === "Enter") runCmd(); });
+  </script>
+</body>
+</html>`;
+}

@@ -1,0 +1,364 @@
+/***************************************
+ * GRID_Accounts.gs
+ * Hourly: refresh GMB accounts + GA4 accounts/properties
+ * Rules:
+ * - NO deletes
+ * - Dedupe + append new rows
+ * - Existing rows: update last_seen_utc (+ optionally names/types)
+ ***************************************/
+
+function accountsRefresh() {
+  if (!requireAuth()) return;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ensureGridTabs_();
+
+  const service = getService();
+  const nowIso = new Date().toISOString();
+  const authorizedUser = getCurrentAuthorizedUserEmail_();
+
+  if (!authorizedUser) {
+    throw new Error("Unable to determine active user email for authorized_user.");
+  }
+
+  const shGmb = ss.getSheetByName(GRID_TABS.CONFIG_GMB);
+  const shGa4 = ss.getSheetByName(GRID_TABS.CONFIG_GA4);
+
+  let apiCallCounter = {
+    gmb: 0,
+    ga4: 0
+  };
+
+  const gmbAccounts = fetchGmbAccounts_(service, apiCallCounter);            
+  const ga4Props = fetchGa4AccountsAndProperties_(service, apiCallCounter);  
+
+  const gmbRes = upsertConfigGmb_(shGmb, gmbAccounts, nowIso, authorizedUser);
+  const ga4Res = upsertConfigGa4_(shGa4, ga4Props, nowIso, authorizedUser);
+
+  const totalApiCalls = apiCallCounter.gmb + apiCallCounter.ga4;
+  const apiSummary = `GMB Accounts x${apiCallCounter.gmb}, GA4 Admin x${apiCallCounter.ga4}`;
+
+  logApiUsage_(
+    nowIso.slice(0, 10),
+    "ACCOUNTS_REFRESH",
+    totalApiCalls,
+    apiSummary
+  );
+
+  pullHistoryAppend_("AccountsRefresh", {
+    gmb_new: gmbRes.newCount,
+    gmb_seen: gmbRes.seenCount,
+    ga4_new: ga4Res.newCount,
+    ga4_seen: ga4Res.seenCount
+  });
+
+  dbg_(
+    "INFO",
+    "AccountsRefresh",
+    `GMB new=${gmbRes.newCount} seen=${gmbRes.seenCount} | GA4 new=${ga4Res.newCount} seen=${ga4Res.seenCount}`,
+    {
+      gmb_new: gmbRes.newCount,
+      gmb_seen: gmbRes.seenCount,
+      ga4_new: ga4Res.newCount,
+      ga4_seen: ga4Res.seenCount
+    }
+  );
+
+
+  return `Accounts refreshed.
+GMB: ${gmbRes.newCount} new, ${gmbRes.seenCount} existing updated
+GA4: ${ga4Res.newCount} new, ${ga4Res.seenCount} existing updated`;
+}
+
+/* ──────────────────────────────
+   FETCHERS
+────────────────────────────── */
+function fetchJsonAccounts_(service, url, counterKey, apiCallCounter) {
+  const res = UrlFetchApp.fetch(url, {
+    method: "get",
+    headers: { Authorization: "Bearer " + service.getAccessToken() },
+    muteHttpExceptions: true
+  });
+  const code = res.getResponseCode();
+  const text = res.getContentText();
+  if (code !== 200) {
+    throw new Error(`Fetch failed (${code}): ${text}\nURL: ${url}`);
+  }
+
+  if (apiCallCounter && counterKey) {
+    apiCallCounter[counterKey]++;
+  }
+
+
+  return text ? JSON.parse(text) : {};
+}
+
+function fetchAllPages_(service, baseUrl, itemsKey, counterKey, apiCallCounter) {
+  const out = [];
+  let pageToken = "";
+  do {
+    const url = baseUrl + (pageToken
+      ? (baseUrl.includes("?") ? "&" : "?") + "pageToken=" + encodeURIComponent(pageToken)
+      : "");
+    const json = fetchJsonAccounts_(service, url, counterKey, apiCallCounter);
+    (json[itemsKey] || []).forEach(x => out.push(x));
+    pageToken = json.nextPageToken || "";
+  } while (pageToken);
+  return out;
+}
+
+function fetchGmbAccounts_(service, apiCallCounter) {
+  const json = fetchJsonAccounts_(service, "https://mybusinessaccountmanagement.googleapis.com/v1/accounts", "gmb", apiCallCounter);
+  const accounts = json.accounts || [];
+
+  return accounts.map(a => ({
+    account_name: String(a.accountName || "").trim(),
+    account_id: String(a.name || "").trim(), // "accounts/###"
+    type: String(a.type || "").trim(),
+    role: String(a.permissionLevel || a.role || "").trim()
+  })).filter(x => x.account_id);
+}
+
+function fetchGa4AccountsAndProperties_(service, apiCallCounter) {
+  const ga4Accounts = fetchAllPages_(service, "https://analyticsadmin.googleapis.com/v1beta/accounts", "accounts", "ga4", apiCallCounter);
+  const rows = [];
+
+  for (const acct of ga4Accounts) {
+    const acctRes = String(acct.name || "").trim();          // "accounts/123"
+    const acctName = String(acct.displayName || "").trim();  // display
+    if (!acctRes) continue;
+
+    const propsUrl =
+      "https://analyticsadmin.googleapis.com/v1beta/properties?filter=" +
+      encodeURIComponent("parent:" + acctRes);
+
+    let props = [];
+    try {
+      props = fetchAllPages_(service, propsUrl, "properties", "ga4", apiCallCounter);
+    } catch (e) {
+      dbg_("WARN", `GA4 properties fetch failed for ${acctRes}: ${String(e && e.message ? e.message : e)}`);
+      continue;
+    }
+
+    props.forEach(p => {
+      const propRes = String(p.name || "").trim();           // "properties/456"
+      const propName = String(p.displayName || "").trim();
+      if (!propRes) return;
+      rows.push({
+        ga4_account_name: acctName,
+        ga4_account_resource: acctRes,
+        property_name: propName,
+        property_resource: propRes
+      });
+    });
+  }
+
+  return rows;
+}
+
+/* ──────────────────────────────
+   UPSERT: CONFIG — GMB
+────────────────────────────── */
+function upsertConfigGmb_(sh, items, nowIso, authorizedUser) {
+  const headers = [
+    "account_name",
+    "account_id",
+    "type",
+    "role",
+    "first_seen_utc",
+    "last_seen_utc",
+    "backfill_months",
+    "authorized_user"
+  ];
+
+  ensureHeader_(sh, headers);
+
+  // Build existing map: account_id|authorized_user -> rowNum
+  const lastRow = sh.getLastRow();
+  const existing = new Map();
+  if (lastRow >= 2) {
+    const data = sh.getRange(2, 1, lastRow - 1, headers.length).getValues();
+    data.forEach((r, i) => {
+      const res = String(r[1] || "").trim();
+      const user = String(r[7] || "").trim();
+      if (res && user) existing.set(`${res}|${user}`, 2 + i);
+    });
+  }
+
+  const newRows = [];
+  let seenCount = 0;
+
+  for (const it of items) {
+    const res = String(it.account_id || "").trim();
+    if (!res) continue;
+
+    const key = `${res}|${authorizedUser}`;
+    const rowNum = existing.get(key);
+    if (!rowNum) {
+      newRows.push([
+        it.account_name || "",
+        res,
+        it.type || "",
+        it.role || "",
+        nowIso,
+        nowIso,
+        18,
+        authorizedUser
+      ]);
+      existing.set(key, -1);
+    } else {
+      // Update last_seen + (optional) name/type/perm (still no deletes)
+      sh.getRange(rowNum, 1).setValue(it.account_name || "");
+      sh.getRange(rowNum, 3).setValue(it.type || "");
+      sh.getRange(rowNum, 4).setValue(it.role || "");
+      sh.getRange(rowNum, 6).setValue(nowIso);
+      sh.getRange(rowNum, 8).setValue(authorizedUser);
+      seenCount++;
+    }
+  }
+
+  if (newRows.length) {
+    sh.getRange(sh.getLastRow() + 1, 1, newRows.length, headers.length).setValues(newRows);
+  }
+
+  return { newCount: newRows.length, seenCount };
+}
+
+/* ──────────────────────────────
+   UPSERT: CONFIG — GA4
+────────────────────────────── */
+function upsertConfigGa4_(sh, items, nowIso, authorizedUser) {
+  const requiredHeaders = [
+    "ga4_account_name",
+    "ga4_account_resource",
+    "property_resource_name", // properties/####
+    "property_name",          // display name
+    "first_seen_utc",
+    "last_seen_utc",
+    "backfill_months",
+    "authorized_user"
+  ];
+
+  // Ensure headers exist (append missing headers to the end; NO deletes)
+  const lastCol = Math.max(1, sh.getLastColumn());
+  let headerRow = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h || "").trim());
+
+  const hasAny = headerRow.some(h => h);
+  if (!hasAny) {
+    sh.getRange(1, 1, 1, requiredHeaders.length).setValues([requiredHeaders]);
+    headerRow = requiredHeaders.slice();
+  } else {
+    const missing = requiredHeaders.filter(h => !headerRow.includes(h));
+    if (missing.length) {
+      sh.getRange(1, headerRow.length + 1, 1, missing.length).setValues([missing]);
+      headerRow = headerRow.concat(missing);
+    }
+  }
+
+  // Build header -> column index map (0-based)
+  const col = {};
+  headerRow.forEach((h, i) => { if (h) col[h] = i; });
+
+  // Build existing map: property_resource_name|authorized_user -> rowNum
+  const lastRow = sh.getLastRow();
+  const existing = new Map();
+  if (lastRow >= 2 && col["property_resource_name"] != null && col["authorized_user"] != null) {
+    const data = sh.getRange(2, 1, lastRow - 1, headerRow.length).getValues();
+    data.forEach((r, i) => {
+      const propRes = String(r[col["property_resource_name"]] || "").trim();
+      const user = String(r[col["authorized_user"]] || "").trim();
+      if (propRes && user) existing.set(`${propRes}|${user}`, 2 + i);
+    });
+  }
+
+  const newRows = [];
+  let seenCount = 0;
+
+  for (const it of items) {
+    const propRes = String(it.property_resource || "").trim(); // "properties/####"
+    if (!propRes) continue;
+
+    const key = `${propRes}|${authorizedUser}`;
+    const rowNum = existing.get(key);
+
+    if (!rowNum) {
+      // Create a full-width row matching current sheet width
+      const row = new Array(headerRow.length).fill("");
+
+      row[col["ga4_account_name"]] = it.ga4_account_name || "";
+      row[col["ga4_account_resource"]] = it.ga4_account_resource || "";
+      row[col["property_resource_name"]] = propRes;
+      row[col["property_name"]] = it.property_name || "";
+      row[col["first_seen_utc"]] = nowIso;
+      row[col["last_seen_utc"]] = nowIso;
+      row[col["backfill_months"]] = 18;
+      row[col["authorized_user"]] = authorizedUser;
+
+      newRows.push(row);
+      existing.set(key, -1);
+    } else {
+      // Update in-place by header name (no positional assumptions)
+      if (col["ga4_account_name"] != null) sh.getRange(rowNum, col["ga4_account_name"] + 1).setValue(it.ga4_account_name || "");
+      if (col["ga4_account_resource"] != null) sh.getRange(rowNum, col["ga4_account_resource"] + 1).setValue(it.ga4_account_resource || "");
+      if (col["property_resource_name"] != null) sh.getRange(rowNum, col["property_resource_name"] + 1).setValue(propRes);
+      if (col["property_name"] != null) sh.getRange(rowNum, col["property_name"] + 1).setValue(it.property_name || "");
+      if (col["last_seen_utc"] != null) sh.getRange(rowNum, col["last_seen_utc"] + 1).setValue(nowIso);
+      if (col["backfill_months"] != null) sh.getRange(rowNum, col["backfill_months"] + 1).setValue(18);
+      if (col["authorized_user"] != null) sh.getRange(rowNum, col["authorized_user"] + 1).setValue(authorizedUser);
+      seenCount++;
+    }
+  }
+
+  if (newRows.length) {
+    sh.getRange(sh.getLastRow() + 1, 1, newRows.length, headerRow.length).setValues(newRows);
+  }
+
+  return { newCount: newRows.length, seenCount };
+}
+
+
+/* ──────────────────────────────
+   SHEET/TAB PLUMBING + LOGGING
+   (safe + minimal; no deletes)
+────────────────────────────── */
+
+
+function ensureOrRepurposeTab_(ss, wantedName, gridNames) {
+  let sh = ss.getSheetByName(wantedName);
+  if (sh) return sh;
+
+  // Repurpose: find a non-grid sheet to rename first
+  const sheets = ss.getSheets();
+  const candidate = sheets.find(s => !gridNames.includes(s.getName()));
+  if (candidate) {
+    candidate.setName(wantedName);
+    return candidate;
+  }
+
+  // Otherwise create
+  return ss.insertSheet(wantedName);
+}
+
+function ensureHeader_(sh, headers) {
+  if (!sh) throw new Error("Missing sheet while ensuring headers.");
+
+  if (sh.getLastRow() === 0) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+    return;
+  }
+
+  // If row 1 is empty, set headers (no deletes)
+  const row1 = sh.getRange(1, 1, 1, headers.length).getValues()[0];
+  const hasAny = row1.some(v => String(v || "").trim() !== "");
+  if (!hasAny) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  }
+}
+
+function pullHistoryAppend_(job, metaObj) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(GRID_TABS.PULL_HISTORY);
+  const row = [new Date().toISOString(), String(job || ""), JSON.stringify(metaObj || {})];
+  sh.getRange(sh.getLastRow() + 1, 1, 1, 3).setValues([row]);
+}
+

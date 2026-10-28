@@ -24,7 +24,7 @@ steps:
       - --region=${_REGION}
       - --platform=managed
       - --service-account=gmb-data-puller@$PROJECT_ID.iam.gserviceaccount.com
-      - --allow-unauthenticated
+      - --no-invoker-iam-check
       - --quiet
 
 images:

@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+node_modules/
+npm-debug.log*
+coverage/
+dist/
+
+# Local Google Cloud credentials must never be committed.
+*.json
+!package.json
+!package-lock.json
+

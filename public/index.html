@@ -8,8 +8,66 @@
   <body>
     <main>
       <h1>GMB Data Puller</h1>
-      <p>The service is ready for puller configuration.</p>
+
+      <section>
+        <h2>Google Connection</h2>
+        <p id="auth-status">Checking connection…</p>
+        <p id="auth-message" hidden></p>
+        <p><a id="auth-link" href="/auth/google">Connect Google</a></p>
+      </section>
+
+      <section>
+        <h2>Data Pulls</h2>
+        <p><button type="button" disabled>Accounts Refresh</button> Coming soon</p>
+        <p><button type="button" disabled>Locations Overview</button> Coming soon</p>
+        <p><button type="button" disabled>Location Details</button> Coming soon</p>
+        <p><button type="button" disabled>Performance Overview</button> Coming soon</p>
+        <p><button type="button" disabled>Search Terms</button> Coming soon</p>
+        <p><button type="button" disabled>Post Overview</button> Coming soon</p>
+        <p><button type="button" disabled>GA4 Sessions</button> Coming soon</p>
+        <p><button type="button" disabled>GA4 Events</button> Coming soon</p>
+      </section>
     </main>
+
+    <script>
+      const statusElement = document.querySelector("#auth-status");
+      const messageElement = document.querySelector("#auth-message");
+      const authLink = document.querySelector("#auth-link");
+      const authResult = new URLSearchParams(window.location.search).get("auth");
+
+      if (authResult) {
+        const messages = {
+          success: "Google authorization completed.",
+          denied: "Google authorization was denied.",
+          error: "Google authorization failed. Please try again."
+        };
+        messageElement.textContent = messages[authResult] || "Google authorization status changed.";
+        messageElement.hidden = false;
+        window.history.replaceState({}, "", "/");
+      }
+
+      fetch("/auth/status")
+        .then((response) => response.json())
+        .then((status) => {
+          if (!status.configured) {
+            statusElement.textContent = "Status: OAuth configuration required";
+            authLink.textContent = "Connect Google";
+            return;
+          }
+
+          if (status.connected) {
+            statusElement.textContent = `Status: Connected as ${status.email}`;
+            authLink.textContent = "Reconnect Google";
+            return;
+          }
+
+          statusElement.textContent = "Status: Not connected";
+          authLink.textContent = "Connect Google";
+        })
+        .catch(() => {
+          statusElement.textContent = "Status: Unable to check connection";
+        });
+    </script>
   </body>
 </html>
 

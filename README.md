@@ -36,4 +36,4 @@ Never commit OAuth secrets, refresh tokens, API keys, service-account keys, or `
 
 ## Current status
 
-The repository foundation and deployment configuration are present. Google OAuth, BigQuery writes, and reference puller translations have not been implemented yet.
+The repository foundation, automated deployment, minimal frontend, and Google OAuth routes are present. The OAuth runtime configuration and initial authorization must be completed before translating the reference pullers. BigQuery writes and reference puller translations have not been implemented yet.
